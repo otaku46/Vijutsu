@@ -348,6 +348,18 @@ pub fn render_keys() -> String {
         "R: snapshot preview",
         "u: undo preview",
         "Ctrl-r: redo preview",
+        "O: open selected file externally",
+        "c: commit current change",
+        "p: push to git remote",
+        "e: edit selected change",
+        "n: new child from selected change",
+        "d: describe selected change",
+        "s: squash current into parent",
+        "a: abandon selected change",
+        "b: rebase selected change",
+        "z: restore selected change",
+        "U: undo last operation",
+        "?: show this help",
         "q: quit",
     ]
     .join("\n")
@@ -381,20 +393,20 @@ fn operation_metadata(operation: &crate::core::OperationNode) -> String {
                 .join(",")
         ));
     }
-    if let Some(user) = &operation.user {
-        if !user.is_empty() {
-            parts.push(format!("user:{user}"));
-        }
+    if let Some(user) = &operation.user
+        && !user.is_empty()
+    {
+        parts.push(format!("user:{user}"));
     }
-    if let Some(host) = &operation.host {
-        if !host.is_empty() {
-            parts.push(format!("host:{host}"));
-        }
+    if let Some(host) = &operation.host
+        && !host.is_empty()
+    {
+        parts.push(format!("host:{host}"));
     }
-    if let Some(timestamp) = &operation.timestamp_start {
-        if !timestamp.is_empty() {
-            parts.push(format!("time:{timestamp}"));
-        }
+    if let Some(timestamp) = &operation.timestamp_start
+        && !timestamp.is_empty()
+    {
+        parts.push(format!("time:{timestamp}"));
     }
 
     if parts.is_empty() {
@@ -417,7 +429,7 @@ fn change_metadata(change: &crate::core::ChangeNode) -> String {
                     name.push_str(remote);
                 }
                 if bookmark.is_conflicted {
-                    name.push_str("!");
+                    name.push('!');
                 }
                 name
             })

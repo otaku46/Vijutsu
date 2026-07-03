@@ -16,8 +16,15 @@ impl TempRepo {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("vijutsu-e2e-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
+        let path = (0..100)
+            .map(|index| {
+                std::env::temp_dir().join(format!(
+                    "vijutsu-e2e-{}-{nonce}-{index}",
+                    std::process::id()
+                ))
+            })
+            .find(|path| std::fs::create_dir(path).is_ok())
+            .expect("failed to create unique temp repo directory");
         let init = Command::new("jj")
             .args(["git", "init", "."])
             .current_dir(&path)
@@ -33,6 +40,34 @@ impl TempRepo {
             .current_dir(&self.path)
             .output()
             .unwrap()
+    }
+
+    fn jj(&self, args: &[&str]) -> Output {
+        Command::new("jj")
+            .args(args)
+            .current_dir(&self.path)
+            .output()
+            .unwrap()
+    }
+
+    fn append(&self, path: &str, text: &str) {
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path.join(path))
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn add_rireki_change(&self, message: &str, text: &str) -> String {
+        let output = self.jj(&["new", "-m", message]);
+        assert_success("jj new rireki change", &output);
+        self.append("rireki.txt", text);
+        let output = self.jj(&["status"]);
+        assert_success("jj status snapshot rireki change", &output);
+        current_commit(&self.path)
     }
 }
 
@@ -85,6 +120,45 @@ fn current_operation(repo: &Path) -> String {
         .unwrap();
     assert_success("jj op log current id", &output);
     stdout(&output).trim().to_string()
+}
+
+fn current_commit(repo: &Path) -> String {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert_success("jj log current commit", &output);
+    stdout(&output).trim().to_string()
+}
+
+fn file_show(repo: &Path, revision: &str, path: &str) -> String {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "file",
+            "show",
+            "-r",
+            revision,
+            path,
+        ])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert_success("jj file show", &output);
+    stdout(&output)
+}
+
+fn short(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 #[test]
@@ -180,4 +254,40 @@ fn help_lists_tui_command() {
 
     assert_success("help", &output);
     assert!(stdout(&output).contains("  tui"));
+}
+
+#[test]
+fn rireki_fixture_selected_change_files_diff_and_materialized_content_match() {
+    let repo = TempRepo::new();
+    repo.add_rireki_change("rireki:a", "a\n");
+    let commit = repo.add_rireki_change("rireki:B", "B\n");
+
+    let output = repo.run(&["inspect", "--change", &commit]);
+
+    assert_success("inspect selected rireki:B", &output);
+    let out = stdout(&output);
+    assert!(out.contains("Files\n"), "{out}");
+    assert!(out.contains("rireki.txt"), "{out}");
+    assert!(out.contains("Diff\n"), "{out}");
+    assert!(
+        out.contains("diff --git a/rireki.txt b/rireki.txt"),
+        "{out}"
+    );
+    assert!(out.contains("+B"), "{out}");
+    assert_eq!(file_show(&repo.path, &commit, "rireki.txt"), "a\nB\n");
+}
+
+#[test]
+fn follow_current_inspect_observes_latest_operation_after_external_jj_change() {
+    let repo = TempRepo::new();
+    let before = current_operation(&repo.path);
+    let _ = repo.add_rireki_change("rireki:a", "a\n");
+    let after = current_operation(&repo.path);
+    assert_ne!(before, after);
+
+    let output = repo.run(&["inspect", "--limit", "5"]);
+
+    assert_success("inspect follows current operation", &output);
+    let out = stdout(&output);
+    assert!(out.contains(short(&after)), "{out}");
 }

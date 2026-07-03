@@ -24,6 +24,7 @@ use vijutsu::cli::{
     fetch_diff, fetch_diff_for_path, fetch_file_summary, fetch_operation_records, jj_version,
 };
 use vijutsu::core::{JjCapabilities, ObservationFreshness};
+use vijutsu::graph::{GraphCharset, GraphNode, render_graph_rows};
 use vijutsu::mutation::{
     RestorePreview, RevertPreview, UndoPreview, abandon_preview, execute_mutation, redo_preview,
     restore_warnings, snapshot_refresh_result, snapshot_refresh_warnings, undo_warnings,
@@ -31,6 +32,9 @@ use vijutsu::mutation::{
 use vijutsu::observation::{
     SelectionState, build_observation, change_graph_from_parse, compute_operation_delta,
     operation_graph_from_parse, resolve_change_selection, validate_head_consistency,
+};
+use vijutsu::state::{
+    CommandKind, Freshness, ObservationContext, ViewMode, guard_command, guard_execution_head,
 };
 use vijutsu::tui::{
     ChangeDetails, DeltaDetails, KeyAction, UiCommand, UiPane, handle_key_input,
@@ -257,18 +261,25 @@ struct TuiApp {
     status: String,
     pending_mutation: Option<PendingMutation>,
     describe_input: Option<DescribeInput>,
+    commit_input: Option<CommitInput>,
+    rebase_source: Option<SelectedChange>,
 }
 
 struct TuiOperation {
     id: String,
     label: String,
+    parent_ids: Vec<String>,
     is_current: bool,
+    is_head: bool,
 }
 
 struct TuiChange {
     change_id: String,
     commit_id: String,
     label: String,
+    parent_commit_ids: Vec<String>,
+    bookmarks: Vec<String>,
+    is_workspace: bool,
 }
 
 struct TuiFile {
@@ -279,12 +290,47 @@ struct TuiFile {
 #[derive(Debug, Clone)]
 enum PendingMutation {
     Undo,
-    Edit { commit_id: String },
-    NewChild { commit_id: String },
+    Edit {
+        change: SelectedChange,
+    },
+    NewChild {
+        change: SelectedChange,
+    },
+    SquashCurrent {
+        source: SelectedChange,
+        destination: SelectedChange,
+    },
+    Abandon {
+        change: SelectedChange,
+        descendants: Vec<String>,
+        bookmarks: Vec<String>,
+    },
+    Rebase {
+        source: SelectedChange,
+        destination: SelectedChange,
+    },
+    Restore {
+        change: SelectedChange,
+    },
+    Commit {
+        message: String,
+    },
+    Push,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedChange {
+    change_id: String,
+    commit_id: String,
 }
 
 struct DescribeInput {
+    change_id: String,
     commit_id: String,
+    message: String,
+}
+
+struct CommitInput {
     message: String,
 }
 
@@ -321,15 +367,199 @@ impl PendingMutation {
             PendingMutation::Undo => "undo last operation",
             PendingMutation::Edit { .. } => "edit selected change",
             PendingMutation::NewChild { .. } => "new child from selected change",
+            PendingMutation::SquashCurrent { .. } => "squash current into parent",
+            PendingMutation::Abandon { .. } => "abandon selected change",
+            PendingMutation::Rebase { .. } => "rebase selected change",
+            PendingMutation::Restore { .. } => "restore selected change",
+            PendingMutation::Commit { .. } => "commit current change",
+            PendingMutation::Push => "push to git remote",
         }
     }
 
     fn command_args(&self) -> Vec<String> {
         match self {
             PendingMutation::Undo => vec!["undo".to_string()],
-            PendingMutation::Edit { commit_id } => vec!["edit".to_string(), commit_id.clone()],
-            PendingMutation::NewChild { commit_id } => vec!["new".to_string(), commit_id.clone()],
+            PendingMutation::Edit { change } => vec!["edit".to_string(), change.commit_id.clone()],
+            PendingMutation::NewChild { change } => {
+                vec!["new".to_string(), change.commit_id.clone()]
+            }
+            PendingMutation::SquashCurrent { source, .. } => {
+                vec![
+                    "squash".to_string(),
+                    "-r".to_string(),
+                    source.commit_id.clone(),
+                ]
+            }
+            PendingMutation::Abandon { change, .. } => {
+                vec!["abandon".to_string(), change.commit_id.clone()]
+            }
+            PendingMutation::Rebase {
+                source,
+                destination,
+            } => vec![
+                "rebase".to_string(),
+                "-r".to_string(),
+                source.commit_id.clone(),
+                "-o".to_string(),
+                destination.commit_id.clone(),
+            ],
+            PendingMutation::Restore { change } => {
+                vec![
+                    "restore".to_string(),
+                    "--changes-in".to_string(),
+                    change.commit_id.clone(),
+                ]
+            }
+            PendingMutation::Commit { message } => {
+                vec!["commit".to_string(), "-m".to_string(), message.clone()]
+            }
+            PendingMutation::Push => vec!["git".to_string(), "push".to_string()],
         }
+    }
+
+    fn preferred_change_id(&self) -> Option<&str> {
+        match self {
+            PendingMutation::Edit { change }
+            | PendingMutation::NewChild { change }
+            | PendingMutation::SquashCurrent { source: change, .. }
+            | PendingMutation::Rebase { source: change, .. }
+            | PendingMutation::Restore { change } => Some(&change.change_id),
+            PendingMutation::Undo
+            | PendingMutation::Abandon { .. }
+            | PendingMutation::Commit { .. }
+            | PendingMutation::Push => None,
+        }
+    }
+
+    fn preview_lines(&self) -> Vec<String> {
+        let args = self.command_args();
+        let mut lines = match self {
+            PendingMutation::Undo => vec![
+                "Undo last operation".to_string(),
+                "A new operation will be created.".to_string(),
+            ],
+            PendingMutation::Edit { change } => vec![
+                format!("Edit {}", change.brief()),
+                String::new(),
+                "e  Edit selected change directly".to_string(),
+                "n  Create a new child change".to_string(),
+                String::new(),
+                "Working copy moves to selected change.".to_string(),
+                "Its descendants may be rebased as you edit it.".to_string(),
+            ],
+            PendingMutation::NewChild { change } => vec![
+                format!("New child from {}", change.brief()),
+                String::new(),
+                "e  Edit selected change directly".to_string(),
+                "n  Create a new child change".to_string(),
+                String::new(),
+                "Working copy moves to a new child of the selected change.".to_string(),
+            ],
+            PendingMutation::SquashCurrent {
+                source,
+                destination,
+            } => vec![
+                "Squash current into parent".to_string(),
+                String::new(),
+                format!("source: {}", source.brief()),
+                format!("destination: {}", destination.brief()),
+                String::new(),
+                "Before             After".to_string(),
+                String::new(),
+                "@ C                @ empty".to_string(),
+                "│                  │".to_string(),
+                "○ B                ○ B+C".to_string(),
+            ],
+            PendingMutation::Abandon {
+                change,
+                descendants,
+                bookmarks,
+            } => vec![
+                format!("Abandon {}", change.brief()),
+                String::new(),
+                "Before             After".to_string(),
+                String::new(),
+                "@ C                @ C'".to_string(),
+                "│                  │".to_string(),
+                "○ B       ->       ○ A".to_string(),
+                "│".to_string(),
+                "○ A".to_string(),
+                String::new(),
+                "Abandoned:".to_string(),
+                format!("  {}", change.brief()),
+                String::new(),
+                "Descendants rebased:".to_string(),
+                format!("  {}", non_empty_join(descendants, "(none)")),
+                String::new(),
+                "Bookmarks affected:".to_string(),
+                format!("  {}", non_empty_join(bookmarks, "(none)")),
+                String::new(),
+                "Undo available:".to_string(),
+                "  y".to_string(),
+            ],
+            PendingMutation::Rebase {
+                source,
+                destination,
+            } => vec![
+                "Rebase".to_string(),
+                String::new(),
+                format!("source: {}", source.brief()),
+                format!("destination: {}", destination.brief()),
+                String::new(),
+                "The selected revision is moved onto the destination.".to_string(),
+                "Descendants are not moved by this command.".to_string(),
+            ],
+            PendingMutation::Restore { change } => vec![
+                format!("Restore changes in {}", change.brief()),
+                String::new(),
+                "This undoes the selected change's diff in the working copy.".to_string(),
+                "It is equivalent to jj restore --changes-in <selected>.".to_string(),
+                "Use U to undo this operation if it was not intended.".to_string(),
+            ],
+            PendingMutation::Commit { message } => vec![
+                "Commit current working-copy change".to_string(),
+                String::new(),
+                "This updates the current change description and creates a new child change."
+                    .to_string(),
+                "It is equivalent to jj commit -m <message>.".to_string(),
+                String::new(),
+                "Message:".to_string(),
+                format!("  {message}"),
+            ],
+            PendingMutation::Push => vec![
+                "Push to Git remote".to_string(),
+                String::new(),
+                "This runs jj git push with the repository's default remote/bookmark behavior."
+                    .to_string(),
+                "It may update remote bookmarks after Jujutsu safety checks.".to_string(),
+                "If this is not intended, press N or Esc.".to_string(),
+            ],
+        };
+        lines.push(String::new());
+        lines.push(format!("Command: jj {}", args.join(" ")));
+        lines.push("Press y to execute, Esc or N to cancel.".to_string());
+        lines
+    }
+}
+
+impl SelectedChange {
+    fn brief(&self) -> String {
+        format!("{} {}", short(&self.change_id), short(&self.commit_id))
+    }
+}
+
+impl From<&TuiChange> for SelectedChange {
+    fn from(change: &TuiChange) -> Self {
+        Self {
+            change_id: change.change_id.clone(),
+            commit_id: change.commit_id.clone(),
+        }
+    }
+}
+
+impl TuiChange {
+    fn brief(&self) -> String {
+        format!("{} {}", short(&self.change_id), short(&self.commit_id))
     }
 }
 
@@ -357,6 +587,8 @@ impl TuiApp {
             status: "browse mode; mutations require y confirmation".to_string(),
             pending_mutation: None,
             describe_input: None,
+            commit_input: None,
+            rebase_source: None,
         };
         app.refresh_all();
         app
@@ -372,9 +604,33 @@ impl TuiApp {
                 self.selected_operation =
                     clamp_index(self.selected_operation, self.operations.len());
                 self.refresh_changes();
-                self.status = format!("gen {} sync; stale async results: none", self.observed_at);
+                self.set_browse_status(format!(
+                    "gen {} sync; stale async results: none",
+                    self.observed_at
+                ));
             }
             Err(error) => self.status = error,
+        }
+    }
+
+    fn refresh_after_mutation(&mut self, preferred_change_id: Option<&str>) {
+        self.refresh_all();
+        if let Some(index) = self
+            .operations
+            .iter()
+            .position(|operation| operation.is_current)
+        {
+            self.selected_operation = index;
+            self.refresh_changes();
+        }
+        if let Some(change_id) = preferred_change_id
+            && let Some(index) = self
+                .changes
+                .iter()
+                .position(|change| change.change_id == change_id)
+        {
+            self.selected_change = index;
+            self.refresh_files();
         }
     }
 
@@ -476,10 +732,153 @@ impl TuiApp {
             .map(|operation| operation.id.clone())
     }
 
+    fn current_operation(&self) -> Option<&TuiOperation> {
+        self.operations
+            .iter()
+            .find(|operation| operation.is_current)
+    }
+
+    fn is_viewing_current_operation(&self) -> bool {
+        self.operations
+            .get(self.selected_operation)
+            .map(|operation| operation.is_current)
+            .unwrap_or(false)
+    }
+
+    fn view_mode(&self) -> &'static str {
+        if self.is_viewing_current_operation() {
+            "current"
+        } else {
+            "historical"
+        }
+    }
+
+    fn historical_warning(&self) -> Option<String> {
+        if self.is_viewing_current_operation() {
+            return None;
+        }
+        Some(format!(
+            "HISTORICAL VIEW - mutations disabled | current op {} | viewing op {}",
+            self.current_operation()
+                .map(|operation| short(&operation.id).to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            self.selected_operation_id()
+                .map(|id| short(&id).to_string())
+                .unwrap_or_else(|| "?".to_string())
+        ))
+    }
+
+    fn observation_context(&self) -> ObservationContext {
+        let selected = self
+            .selected_operation_id()
+            .unwrap_or_else(|| "?".to_string());
+        let current = self
+            .current_operation()
+            .map(|operation| operation.id.clone())
+            .unwrap_or_else(|| self.current_head.clone());
+        ObservationContext {
+            view_mode: if self.is_viewing_current_operation() {
+                ViewMode::FollowCurrent
+            } else {
+                ViewMode::Historical(selected.clone())
+            },
+            observed_operation: selected,
+            current_operation: current,
+            freshness: Freshness::Current,
+        }
+    }
+
+    fn operation_context_lines(&self) -> Vec<String> {
+        let current = self
+            .current_operation()
+            .map(|operation| short(&operation.id).to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let viewing = self
+            .selected_operation_id()
+            .map(|id| short(&id).to_string())
+            .unwrap_or_else(|| "?".to_string());
+        vec![
+            format!("current op: {current}"),
+            format!("viewing op: {viewing} ({})", self.view_mode()),
+        ]
+    }
+
+    fn block_historical_mutation(&mut self, action: &str) -> bool {
+        if guard_command(&self.observation_context(), CommandKind::MutateCurrent).is_ok() {
+            return false;
+        }
+        self.detail_title = "4 Historical View".to_string();
+        self.detail = self.operation_context_lines();
+        self.detail.push(String::new());
+        self.detail.push(format!(
+            "{action} is blocked while viewing a historical operation."
+        ));
+        self.detail.push(
+            "Select the current operation (@) before mutating; r only refreshes the view."
+                .to_string(),
+        );
+        self.detail.push(
+            "OP pane Enter only shows operation details; it does not change mutation target."
+                .to_string(),
+        );
+        self.detail_scroll = 0;
+        self.pane = UiPane::Diff;
+        self.status = self
+            .historical_warning()
+            .unwrap_or_else(|| "historical view: mutation blocked".to_string());
+        true
+    }
+
+    fn set_browse_status(&mut self, status: impl Into<String>) {
+        self.status = self.historical_warning().unwrap_or_else(|| status.into());
+    }
+
     fn selected_commit_id(&self) -> Option<String> {
         self.changes
             .get(self.selected_change)
             .map(|change| change.commit_id.clone())
+    }
+
+    fn selected_change(&self) -> Option<SelectedChange> {
+        self.changes
+            .get(self.selected_change)
+            .map(SelectedChange::from)
+    }
+
+    fn workspace_change(&self) -> Option<SelectedChange> {
+        self.changes
+            .iter()
+            .find(|change| change.is_workspace)
+            .map(SelectedChange::from)
+    }
+
+    fn change_by_commit(&self, commit_id: &str) -> Option<SelectedChange> {
+        self.changes
+            .iter()
+            .find(|change| change.commit_id == commit_id)
+            .map(SelectedChange::from)
+    }
+
+    fn descendants_of(&self, commit_id: &str) -> Vec<String> {
+        let mut pending = vec![commit_id.to_string()];
+        let mut descendants = Vec::new();
+        while let Some(parent) = pending.pop() {
+            for change in self
+                .changes
+                .iter()
+                .filter(|change| change.parent_commit_ids.iter().any(|id| id == &parent))
+            {
+                if descendants
+                    .iter()
+                    .any(|id: &String| id == &change.commit_id)
+                {
+                    continue;
+                }
+                descendants.push(change.brief());
+                pending.push(change.commit_id.clone());
+            }
+        }
+        descendants
     }
 
     fn selected_file_path(&self) -> &str {
@@ -494,20 +893,10 @@ impl TuiApp {
             .selected_operation_id()
             .map(|id| short(&id).to_string())
             .unwrap_or_else(|| "?".to_string());
-        let mode = self
-            .operations
-            .get(self.selected_operation)
-            .map(|operation| {
-                if operation.is_current {
-                    "current"
-                } else {
-                    "historical"
-                }
-            })
-            .unwrap_or("unknown");
         format!(
-            "op {op} | current head {} | {mode} | snapshot only | fs unchanged | gen {}",
+            "op {op} | current head {} | {} | snapshot only | fs unchanged | gen {}",
             short(&self.current_head),
+            self.view_mode(),
             self.observed_at
         )
     }
@@ -548,17 +937,56 @@ impl TuiApp {
     }
 
     fn operation_labels(&self) -> Vec<String> {
-        self.operations
-            .iter()
-            .map(|operation| operation.label.clone())
-            .collect()
+        let charset = GraphCharset::from_env();
+        render_graph_rows(
+            &self
+                .operations
+                .iter()
+                .map(|operation| GraphNode {
+                    id: operation.id.clone(),
+                    parent_ids: operation.parent_ids.clone(),
+                    marker: if operation.is_current {
+                        '@'
+                    } else if operation.is_head {
+                        match charset {
+                            GraphCharset::Unicode => '◆',
+                            GraphCharset::Ascii => '*',
+                        }
+                    } else {
+                        match charset {
+                            GraphCharset::Unicode => '○',
+                            GraphCharset::Ascii => 'o',
+                        }
+                    },
+                    text: operation.label.clone(),
+                })
+                .collect::<Vec<_>>(),
+            charset,
+        )
     }
 
     fn change_labels(&self) -> Vec<String> {
-        self.changes
-            .iter()
-            .map(|change| change.label.clone())
-            .collect()
+        let charset = GraphCharset::from_env();
+        render_graph_rows(
+            &self
+                .changes
+                .iter()
+                .map(|change| GraphNode {
+                    id: change.commit_id.clone(),
+                    parent_ids: change.parent_commit_ids.clone(),
+                    marker: if change.is_workspace {
+                        '@'
+                    } else {
+                        match charset {
+                            GraphCharset::Unicode => '○',
+                            GraphCharset::Ascii => 'o',
+                        }
+                    },
+                    text: change.label.clone(),
+                })
+                .collect::<Vec<_>>(),
+            charset,
+        )
     }
 
     fn file_labels(&self) -> Vec<String> {
@@ -572,22 +1000,19 @@ impl TuiApp {
             UiPane::Files => UiPane::Change,
             UiPane::Diff => UiPane::Files,
         };
-        self.status = format!("pane: {:?}", self.pane);
+        self.set_browse_status(format!("pane: {:?}", self.pane));
     }
 
     fn focus_at(&mut self, column: u16, row: u16, width: u16, height: u16) {
-        let body_height = height.saturating_sub(3);
+        let body_height = height.saturating_sub(6);
         let old_operation = self.selected_operation;
         let old_change = self.selected_change;
         let old_file = self.selected_file;
         let item_row = row.saturating_sub(1) as usize;
-        let op_height = body_height.saturating_sub(8);
         self.pane = if row >= body_height {
             self.pane
         } else if column < width.saturating_mul(28) / 100 {
-            if row < op_height {
-                self.selected_operation = clamp_index(item_row, self.operations.len());
-            }
+            self.selected_operation = clamp_index(item_row, self.operations.len());
             UiPane::Operation
         } else if column < width.saturating_mul(56) / 100 {
             if row < body_height.saturating_mul(55) / 100 {
@@ -603,7 +1028,7 @@ impl TuiApp {
             UiPane::Diff
         };
         self.sync_after_selection(old_operation, old_change, old_file);
-        self.status = format!("pane: {:?}", self.pane);
+        self.set_browse_status(format!("pane: {:?}", self.pane));
     }
 
     fn sync_after_selection(&mut self, old_operation: usize, old_change: usize, old_file: usize) {
@@ -617,6 +1042,7 @@ impl TuiApp {
             return;
         }
         self.detail_scroll = 0;
+        self.set_browse_status("selection updated");
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -665,19 +1091,32 @@ impl TuiApp {
     }
 
     fn open_focused(&mut self) {
-        let (title, line) = match self.pane {
-            UiPane::Operation | UiPane::Repository => (
-                "4 Operation",
-                selected_line(&self.operation_labels(), self.selected_operation),
-            ),
+        let (title, lines) = match self.pane {
+            UiPane::Operation | UiPane::Repository => {
+                let mut lines = self.operation_context_lines();
+                lines.push(String::new());
+                lines.push(selected_line(
+                    &self.operation_labels(),
+                    self.selected_operation,
+                ));
+                lines.push(String::new());
+                lines.push(
+                    "Enter shows operation details only; it never changes mutation target."
+                        .to_string(),
+                );
+                if !self.is_viewing_current_operation() {
+                    lines.push("Mutations are disabled in historical views.".to_string());
+                }
+                ("4 Operation", lines)
+            }
             UiPane::Change => (
                 "4 Change",
-                selected_line(&self.change_labels(), self.selected_change),
+                vec![selected_line(&self.change_labels(), self.selected_change)],
             ),
             UiPane::Files => {
                 self.refresh_diff();
                 self.pane = UiPane::Diff;
-                self.status = "opened file diff".to_string();
+                self.set_browse_status("opened file diff");
                 return;
             }
             UiPane::Diff => {
@@ -686,10 +1125,10 @@ impl TuiApp {
             }
         };
         self.detail_title = title.to_string();
-        self.detail = vec![line];
+        self.detail = lines;
         self.detail_scroll = 0;
         self.pane = UiPane::Diff;
-        self.status = format!("opened {title} detail");
+        self.set_browse_status(format!("opened {title} detail"));
     }
 
     fn set_preview(&mut self, title: &str, args: &[&str]) {
@@ -703,51 +1142,196 @@ impl TuiApp {
         self.status = format!("rendered {title}");
     }
 
+    fn show_help(&mut self) {
+        self.detail_title = "4 Help".to_string();
+        self.detail = render_keys().lines().map(str::to_string).collect();
+        self.detail_scroll = 0;
+        self.pane = UiPane::Diff;
+        self.status = "help".to_string();
+    }
+
     fn plan_undo(&mut self) {
+        if self.block_historical_mutation("undo") {
+            return;
+        }
         self.set_pending_mutation(PendingMutation::Undo);
     }
 
     fn plan_edit_selected(&mut self) {
-        let Some(commit_id) = self.selected_commit_id() else {
+        if self.block_historical_mutation("edit") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
             self.status = "no change selected".to_string();
             return;
         };
-        if is_root_commit(&commit_id) {
+        if is_root_commit(&change.commit_id) {
             self.status = "cannot edit ROOT".to_string();
             return;
         }
-        self.set_pending_mutation(PendingMutation::Edit { commit_id });
+        self.set_pending_mutation(PendingMutation::Edit { change });
     }
 
     fn plan_new_child_selected(&mut self) {
-        let Some(commit_id) = self.selected_commit_id() else {
+        if self.block_historical_mutation("new child") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
             self.status = "no change selected".to_string();
             return;
         };
-        if is_root_commit(&commit_id) {
+        if is_root_commit(&change.commit_id) {
             self.status = "cannot create child from ROOT".to_string();
             return;
         }
-        self.set_pending_mutation(PendingMutation::NewChild { commit_id });
+        self.set_pending_mutation(PendingMutation::NewChild { change });
     }
 
-    fn begin_describe_selected(&mut self) {
-        let Some(commit_id) = self.selected_commit_id() else {
+    fn plan_squash_current(&mut self) {
+        if self.block_historical_mutation("squash") {
+            return;
+        }
+        let Some(source) = self.workspace_change().or_else(|| self.selected_change()) else {
             self.status = "no change selected".to_string();
             return;
         };
-        if is_root_commit(&commit_id) {
+        if is_root_commit(&source.commit_id) {
+            self.status = "cannot squash ROOT".to_string();
+            return;
+        }
+        let destination = self
+            .changes
+            .iter()
+            .find(|change| {
+                change.commit_id == source.commit_id
+                    && change.parent_commit_ids.len() == 1
+                    && !is_root_commit(&change.parent_commit_ids[0])
+            })
+            .and_then(|change| self.change_by_commit(&change.parent_commit_ids[0]))
+            .or_else(|| {
+                self.changes
+                    .iter()
+                    .find(|change| change.commit_id == source.commit_id)
+                    .and_then(|change| change.parent_commit_ids.first())
+                    .and_then(|id| self.change_by_commit(id))
+            });
+        let Some(destination) = destination else {
+            self.status = "squash destination parent not found".to_string();
+            return;
+        };
+        self.set_pending_mutation(PendingMutation::SquashCurrent {
+            source,
+            destination,
+        });
+    }
+
+    fn plan_abandon_selected(&mut self) {
+        if self.block_historical_mutation("abandon") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&change.commit_id) {
+            self.status = "cannot abandon ROOT".to_string();
+            return;
+        }
+        let descendants = self.descendants_of(&change.commit_id);
+        let bookmarks = self
+            .changes
+            .get(self.selected_change)
+            .map(|change| change.bookmarks.clone())
+            .unwrap_or_default();
+        self.set_pending_mutation(PendingMutation::Abandon {
+            change,
+            descendants,
+            bookmarks,
+        });
+    }
+
+    fn begin_rebase_selected(&mut self) {
+        if self.block_historical_mutation("rebase") {
+            return;
+        }
+        let Some(source) = self.selected_change() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&source.commit_id) {
+            self.status = "cannot rebase ROOT".to_string();
+            return;
+        }
+        self.rebase_source = Some(source.clone());
+        self.detail_title = "4 Rebase source".to_string();
+        self.detail = vec![
+            format!("source: {}", source.brief()),
+            "Move the cursor to the destination change and press Enter.".to_string(),
+            "Esc clears rebase selection.".to_string(),
+        ];
+        self.detail_scroll = 0;
+        self.pane = UiPane::Change;
+        self.status = "select rebase destination".to_string();
+    }
+
+    fn finish_rebase_selection(&mut self) {
+        if self.block_historical_mutation("rebase") {
+            self.rebase_source = None;
+            return;
+        }
+        let Some(source) = self.rebase_source.take() else {
+            return;
+        };
+        let Some(destination) = self.selected_change() else {
+            self.status = "no rebase destination selected".to_string();
+            return;
+        };
+        if source.commit_id == destination.commit_id {
+            self.status = "source and destination are the same change".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::Rebase {
+            source,
+            destination,
+        });
+    }
+
+    fn plan_restore_selected(&mut self) {
+        if self.block_historical_mutation("restore") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&change.commit_id) {
+            self.status = "cannot restore ROOT".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::Restore { change });
+    }
+
+    fn begin_describe_selected(&mut self) {
+        if self.block_historical_mutation("describe") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&change.commit_id) {
             self.status = "cannot describe ROOT".to_string();
             return;
         }
         self.describe_input = Some(DescribeInput {
-            commit_id: commit_id.clone(),
+            change_id: change.change_id.clone(),
+            commit_id: change.commit_id.clone(),
             message: String::new(),
         });
-        self.detail_title = format!("4 Describe {}", short(&commit_id));
+        self.detail_title = format!("4 Describe {}", short(&change.commit_id));
         self.detail = vec![
             "Type new description.".to_string(),
-            "Enter: apply, Esc: cancel, Backspace: delete".to_string(),
+            "Enter: apply, Esc/N: cancel, Backspace: delete".to_string(),
             String::new(),
         ];
         self.detail_scroll = 0;
@@ -775,7 +1359,7 @@ impl TuiApp {
         };
         self.detail = vec![
             "Type new description.".to_string(),
-            "Enter: apply, Esc: cancel, Backspace: delete".to_string(),
+            "Enter: apply, Esc/N: cancel, Backspace: delete".to_string(),
             String::new(),
             input.message.clone(),
         ];
@@ -783,10 +1367,14 @@ impl TuiApp {
 
     fn cancel_describe_input(&mut self) {
         self.describe_input = None;
+        self.refresh_diff();
         self.status = "describe cancelled".to_string();
     }
 
     fn execute_describe_input(&mut self) {
+        if self.block_historical_mutation("describe") {
+            return;
+        }
         let Some(input) = self.describe_input.take() else {
             return;
         };
@@ -796,7 +1384,7 @@ impl TuiApp {
         }
         let args = vec![
             "describe".to_string(),
-            input.commit_id,
+            input.commit_id.clone(),
             "-m".to_string(),
             input.message,
         ];
@@ -804,7 +1392,7 @@ impl TuiApp {
             Ok(result) => {
                 let success = result.exit_code == 0;
                 if success {
-                    self.refresh_all();
+                    self.refresh_after_mutation(Some(&input.change_id));
                 }
                 self.detail_title = "4 Mutation describe".to_string();
                 self.detail = command_result_lines(&result);
@@ -825,14 +1413,86 @@ impl TuiApp {
         }
     }
 
-    fn set_pending_mutation(&mut self, mutation: PendingMutation) {
-        let args = mutation.command_args();
-        self.detail_title = format!("4 Confirm {}", mutation.name());
+    fn begin_commit_input(&mut self) {
+        if self.block_historical_mutation("commit") {
+            return;
+        }
+        self.commit_input = Some(CommitInput {
+            message: String::new(),
+        });
+        self.detail_title = "4 Commit".to_string();
         self.detail = vec![
-            format!("Pending mutation: {}", mutation.name()),
-            format!("Command: jj {}", args.join(" ")),
-            "Press y to execute, Esc or n to cancel.".to_string(),
+            "Type commit description.".to_string(),
+            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+            String::new(),
         ];
+        self.detail_scroll = 0;
+        self.pane = UiPane::Diff;
+        self.status = "commit input".to_string();
+    }
+
+    fn push_commit_char(&mut self, ch: char) {
+        if let Some(input) = &mut self.commit_input {
+            input.message.push(ch);
+            self.render_commit_input();
+        }
+    }
+
+    fn pop_commit_char(&mut self) {
+        if let Some(input) = &mut self.commit_input {
+            input.message.pop();
+            self.render_commit_input();
+        }
+    }
+
+    fn render_commit_input(&mut self) {
+        let Some(input) = &self.commit_input else {
+            return;
+        };
+        self.detail = vec![
+            "Type commit description.".to_string(),
+            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+            String::new(),
+            input.message.clone(),
+        ];
+    }
+
+    fn cancel_commit_input(&mut self) {
+        self.commit_input = None;
+        self.refresh_diff();
+        self.status = "commit cancelled".to_string();
+    }
+
+    fn confirm_commit_input(&mut self) {
+        if self.block_historical_mutation("commit") {
+            return;
+        }
+        let Some(input) = self.commit_input.take() else {
+            return;
+        };
+        let message = input.message.trim().to_string();
+        if message.is_empty() {
+            self.status = "commit message is empty; cancelled".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::Commit { message });
+    }
+
+    fn plan_push(&mut self) {
+        if self.block_historical_mutation("push") {
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::Push);
+    }
+
+    fn set_pending_mutation(&mut self, mutation: PendingMutation) {
+        if self.block_historical_mutation(mutation.name()) {
+            return;
+        }
+        self.detail_title = format!("4 Confirm {}", mutation.name());
+        self.detail = self.operation_context_lines();
+        self.detail.push(String::new());
+        self.detail.extend(mutation.preview_lines());
         self.detail_scroll = 0;
         self.pane = UiPane::Diff;
         self.status = "confirm mutation with y".to_string();
@@ -841,21 +1501,26 @@ impl TuiApp {
 
     fn cancel_pending_mutation(&mut self) {
         self.pending_mutation = None;
+        self.refresh_diff();
         self.status = "mutation cancelled".to_string();
     }
 
     fn execute_pending_mutation(&mut self) {
+        if self.block_historical_mutation("execute mutation") {
+            return;
+        }
         let Some(mutation) = self.pending_mutation.take() else {
             self.status = "no pending mutation".to_string();
             return;
         };
+        let preferred_change_id = mutation.preferred_change_id().map(str::to_string);
         let args = mutation.command_args();
         let result = execute_mutation(args.clone());
         match result {
             Ok(result) => {
                 let success = result.exit_code == 0;
                 if success {
-                    self.refresh_all();
+                    self.refresh_after_mutation(preferred_change_id.as_deref());
                 }
                 self.detail_title = format!("4 Mutation {}", mutation.name());
                 self.detail = command_result_lines(&result);
@@ -936,7 +1601,11 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             let files_title = app.files_title();
             let areas = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(3)])
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                ])
                 .split(frame.size());
             let body = Layout::default()
                 .direction(Direction::Horizontal)
@@ -950,10 +1619,6 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body[1]);
-            let left = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(5), Constraint::Length(15)])
-                .split(body[0]);
             app.file_visible_rows = middle[1].height.saturating_sub(2).max(1) as usize;
             app.keep_selected_file_visible();
 
@@ -966,9 +1631,8 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                     app.pane == UiPane::Operation || app.pane == UiPane::Repository,
                     Color::Cyan,
                 ),
-                left[0],
+                body[0],
             );
-            frame.render_widget(key_pane(), left[1]);
             frame.render_widget(
                 selectable_list(
                     &change_title,
@@ -1006,20 +1670,31 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 Paragraph::new(Line::from(vec![
                     Span::styled(app.context(), Style::default().fg(Color::Cyan)),
                     Span::raw(" | "),
-                    Span::styled(app.status.as_str(), Style::default().fg(Color::Green)),
+                    Span::styled(
+                        app.status.as_str(),
+                        Style::default().fg(if app.is_viewing_current_operation() {
+                            Color::Green
+                        } else {
+                            Color::Red
+                        }),
+                    ),
                 ]))
                 .block(Block::default().borders(Borders::ALL)),
                 areas[1],
+            );
+            frame.render_widget(
+                Paragraph::new(bottom_key_hint()).block(Block::default().borders(Borders::ALL)),
+                areas[2],
             );
         })?;
 
         let event = event::read()?;
         let Event::Key(key) = event else {
-            if let Event::Mouse(mouse) = event {
-                if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    let size = terminal.size()?;
-                    app.focus_at(mouse.column, mouse.row, size.width, size.height);
-                }
+            if let Event::Mouse(mouse) = event
+                && matches!(mouse.kind, MouseEventKind::Down(_))
+            {
+                let size = terminal.size()?;
+                app.focus_at(mouse.column, mouse.row, size.width, size.height);
             }
             continue;
         };
@@ -1029,44 +1704,58 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
         if app.describe_input.is_some() {
             match key.code {
                 KeyCode::Enter => app.execute_describe_input(),
-                KeyCode::Esc => app.cancel_describe_input(),
+                KeyCode::Esc | KeyCode::Char('N') => app.cancel_describe_input(),
                 KeyCode::Backspace => app.pop_describe_char(),
                 KeyCode::Char(ch) => app.push_describe_char(ch),
-                _ => app.status = "describe input: type, Enter apply, Esc cancel".to_string(),
+                _ => app.status = "describe input: type, Enter apply, Esc/N cancel".to_string(),
+            }
+            continue;
+        }
+        if app.commit_input.is_some() {
+            match key.code {
+                KeyCode::Enter => app.confirm_commit_input(),
+                KeyCode::Esc | KeyCode::Char('N') => app.cancel_commit_input(),
+                KeyCode::Backspace => app.pop_commit_char(),
+                KeyCode::Char(ch) => app.push_commit_char(ch),
+                _ => app.status = "commit input: type, Enter confirm, Esc/N cancel".to_string(),
             }
             continue;
         }
         if app.pending_mutation.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => app.execute_pending_mutation(),
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    app.cancel_pending_mutation()
-                }
+                KeyCode::Esc | KeyCode::Char('N') => app.cancel_pending_mutation(),
                 _ => {
-                    app.status = "pending mutation: press y to execute, Esc/n to cancel".to_string()
+                    app.status = "pending mutation: press y to execute, Esc/N to cancel".to_string()
                 }
             }
             continue;
         }
         let action = match key.code {
+            KeyCode::Esc if app.rebase_source.is_some() => {
+                app.rebase_source = None;
+                app.refresh_diff();
+                app.status = "rebase selection cancelled".to_string();
+                continue;
+            }
             KeyCode::Char('1') => {
                 app.pane = UiPane::Operation;
-                app.status = "pane: Operation".to_string();
+                app.set_browse_status("pane: Operation");
                 continue;
             }
             KeyCode::Char('2') => {
                 app.pane = UiPane::Change;
-                app.status = "pane: Change".to_string();
+                app.set_browse_status("pane: Change");
                 continue;
             }
             KeyCode::Char('3') => {
                 app.pane = UiPane::Files;
-                app.status = "pane: Files".to_string();
+                app.set_browse_status("pane: Files");
                 continue;
             }
             KeyCode::Char('4') => {
                 app.pane = UiPane::Diff;
-                app.status = "pane: Diff".to_string();
+                app.set_browse_status("pane: Diff");
                 continue;
             }
             KeyCode::Char('o') => {
@@ -1102,8 +1791,40 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.begin_describe_selected();
                 continue;
             }
+            KeyCode::Char('c') => {
+                app.begin_commit_input();
+                continue;
+            }
+            KeyCode::Char('p') => {
+                app.plan_push();
+                continue;
+            }
+            KeyCode::Char('s') => {
+                app.plan_squash_current();
+                continue;
+            }
+            KeyCode::Char('a') => {
+                app.plan_abandon_selected();
+                continue;
+            }
+            KeyCode::Char('b') => {
+                app.begin_rebase_selected();
+                continue;
+            }
+            KeyCode::Char('z') => {
+                app.plan_restore_selected();
+                continue;
+            }
+            KeyCode::Char('?') => {
+                app.show_help();
+                continue;
+            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 app.scroll_detail_page(-12);
+                continue;
+            }
+            KeyCode::Enter if app.rebase_source.is_some() => {
+                app.finish_rebase_selection();
                 continue;
             }
             KeyCode::Enter => {
@@ -1131,7 +1852,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 } else {
                     to
                 };
-                app.status = format!("pane: {to:?}");
+                app.set_browse_status(format!("pane: {to:?}"));
             }
             UiCommand::RefreshReadOnly => {
                 app.refresh_all();
@@ -1180,27 +1901,11 @@ fn selectable_list<'a>(
     List::new(rows).block(focused_block(title, focused, color))
 }
 
-fn key_pane<'a>() -> Paragraph<'a> {
-    let lines = vec![
-        Line::raw("Tab/S-Tab focus"),
-        Line::raw("j/k move/scroll"),
-        Line::raw("Enter detail"),
-        Line::raw("S-Enter back page"),
-        Line::raw("O external editor"),
-        Line::raw("u preview undo"),
-        Line::raw("U undo"),
-        Line::raw("Ctrl-r redo"),
-        Line::raw("n new"),
-        Line::raw("e edit"),
-        Line::raw("d describe:conf y/Esc,n"),
-        Line::raw("r refresh"),
-        Line::raw("R snapshot"),
-        Line::raw("q quit"),
-    ];
-
-    Paragraph::new(lines)
-        .block(Block::default().title("Keys").borders(Borders::ALL))
-        .wrap(Wrap { trim: false })
+fn bottom_key_hint<'a>() -> Line<'a> {
+    Line::from(vec![
+        Span::styled("Keys ", Style::default().fg(Color::Cyan)),
+        Span::raw("Tab j/k O n a s U c p ?"),
+    ])
 }
 
 fn visible_from(items: &[String], offset: usize) -> Vec<String> {
@@ -1354,10 +2059,6 @@ fn spawn_new_window(settings: &EditorSettings, file: &str) -> Result<(), String>
         let mut command = Command::new("open");
         command.args(["-na", "Ghostty.app", "--args", "-e"]);
         command
-    } else if settings.launcher == "ghostty" {
-        let mut command = Command::new(&settings.launcher);
-        command.arg("-e");
-        command
     } else {
         let mut command = Command::new(&settings.launcher);
         command.arg("-e");
@@ -1420,6 +2121,9 @@ fn load_operations() -> Result<(String, String, Vec<TuiOperation>), String> {
                 .unwrap_or(false)
             && !record.is_current
         {
+            if let Some(previous) = operations.last_mut() {
+                previous.parent_ids = record.parent_operation_ids.clone();
+            }
             skipped_snapshots += 1;
             continue;
         }
@@ -1431,16 +2135,6 @@ fn load_operations() -> Result<(String, String, Vec<TuiOperation>), String> {
             }
             skipped_snapshots = 0;
         }
-        let mut markers = String::new();
-        if record.is_current {
-            markers.push('@');
-        }
-        if is_head {
-            markers.push('◆');
-        }
-        if markers.is_empty() {
-            markers.push(' ');
-        }
         let description = if is_snapshot {
             "snapshot working copy".to_string()
         } else if record.description.is_empty() {
@@ -1448,18 +2142,24 @@ fn load_operations() -> Result<(String, String, Vec<TuiOperation>), String> {
         } else {
             record.description
         };
+        let semantic_suffix = operation_semantic_suffix(&description).unwrap_or_default();
         operations.push(TuiOperation {
             id: record.operation_id.clone(),
-            label: format!("{markers} {} {description}", short(&record.operation_id)),
+            label: format!(
+                "{} {description}{semantic_suffix}",
+                short(&record.operation_id)
+            ),
+            parent_ids: record.parent_operation_ids,
             is_current: record.is_current,
+            is_head,
         });
     }
-    if skipped_snapshots > 0 {
-        if let Some(previous) = operations.last_mut() {
-            previous
-                .label
-                .push_str(&format!(" (+{skipped_snapshots} snapshots)"));
-        }
+    if skipped_snapshots > 0
+        && let Some(previous) = operations.last_mut()
+    {
+        previous
+            .label
+            .push_str(&format!(" (+{skipped_snapshots} snapshots)"));
     }
 
     Ok((version, current_head, operations))
@@ -1474,11 +2174,12 @@ fn load_changes(version: &str, op_id: &str) -> Result<Vec<TuiChange>, String> {
         .into_iter()
         .map(|record| {
             let root = is_root_commit(&record.commit_id);
+            let is_workspace = !record.working_copies.is_empty();
             let label = if root {
                 "ROOT [immutable]".to_string()
             } else {
                 let mut flags = Vec::new();
-                if !record.working_copies.is_empty() {
+                if is_workspace {
                     flags.push("workspace");
                 }
                 if record.is_empty {
@@ -1496,7 +2197,7 @@ fn load_changes(version: &str, op_id: &str) -> Result<Vec<TuiChange>, String> {
                     format!(" [{}]", flags.join(" "))
                 };
                 format!(
-                    "○ {} {} {}{}",
+                    "{} {} {}{}",
                     short(&record.change_id),
                     short(&record.commit_id),
                     record.description,
@@ -1507,6 +2208,9 @@ fn load_changes(version: &str, op_id: &str) -> Result<Vec<TuiChange>, String> {
                 change_id: record.change_id,
                 commit_id: record.commit_id,
                 label,
+                parent_commit_ids: record.parent_commit_ids,
+                bookmarks: record.bookmarks,
+                is_workspace,
             }
         })
         .collect())
@@ -1563,6 +2267,28 @@ fn selected_line(lines: &[String], index: usize) -> String {
         .get(index)
         .cloned()
         .unwrap_or_else(|| "(nothing selected)".to_string())
+}
+
+fn operation_semantic_suffix(description: &str) -> Option<String> {
+    let (label, rest) = [
+        ("undo: restore to operation ", "undo target"),
+        ("restore to operation ", "state-from"),
+        ("restore operation ", "state-from"),
+        ("revert operation ", "target"),
+        ("undo operation ", "target"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, label)| description.strip_prefix(prefix).map(|rest| (label, rest)))?;
+    let target = rest.split_whitespace().next()?;
+    Some(format!(" [{label}: {}]", short(target)))
+}
+
+fn non_empty_join(values: &[String], fallback: &str) -> String {
+    if values.is_empty() {
+        fallback.to_string()
+    } else {
+        values.join(", ")
+    }
 }
 
 fn clamp_index(index: usize, len: usize) -> usize {
@@ -1684,6 +2410,8 @@ fn mutate(args: Vec<String>) {
         .collect::<Vec<_>>();
     let caps = detect_capabilities().unwrap_or_else(|error| fail_io("detect capabilities", error));
     require_mutation_protocol_capabilities(&caps).unwrap_or_else(|error| fail_message(&error));
+    let version = jj_version_string();
+    let preview_operation = current_operation_id(&version);
     let command_args = match kind {
         "undo" if extra_args.is_empty() => vec!["undo".to_string()],
         "redo" if extra_args.is_empty() => {
@@ -1726,6 +2454,13 @@ fn mutate(args: Vec<String>) {
         }
     };
 
+    let current_operation = current_operation_id(&version);
+    guard_execution_head(&preview_operation, &current_operation).unwrap_or_else(|error| {
+        eprintln!("{}", error.reason);
+        eprintln!("Preview was based on op {}.", short(&preview_operation));
+        eprintln!("Current head is now {}.", short(&current_operation));
+        std::process::exit(1);
+    });
     let result =
         execute_mutation(command_args).unwrap_or_else(|error| fail_io("execute mutation", error));
     print_command_result(&result);
@@ -2259,6 +2994,26 @@ launcher = "tmux"
         assert_eq!(settings.command, vec!["nvim", "{file}"]);
         assert_eq!(settings.placement, OpenPlacement::NewPane);
         assert_eq!(settings.launcher, "tmux");
+    }
+
+    #[test]
+    fn operation_semantic_suffix_shows_references_without_graph_edges() {
+        assert_eq!(
+            operation_semantic_suffix(
+                "undo: restore to operation abcdef1234567890 trailing ignored"
+            )
+            .as_deref(),
+            Some(" [undo target: abcdef12]")
+        );
+        assert_eq!(
+            operation_semantic_suffix("restore to operation fedcba9876543210").as_deref(),
+            Some(" [state-from: fedcba98]")
+        );
+        assert_eq!(
+            operation_semantic_suffix("revert operation 1234567890abcdef").as_deref(),
+            Some(" [target: 12345678]")
+        );
+        assert!(operation_semantic_suffix("abandon commit abcdef").is_none());
     }
 
     fn test_capabilities() -> JjCapabilities {
