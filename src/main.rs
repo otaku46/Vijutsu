@@ -255,6 +255,8 @@ struct TuiApp {
     current_head: String,
     observed_at: u64,
     status: String,
+    pending_mutation: Option<PendingMutation>,
+    describe_input: Option<DescribeInput>,
 }
 
 struct TuiOperation {
@@ -272,6 +274,18 @@ struct TuiChange {
 struct TuiFile {
     path: String,
     label: String,
+}
+
+#[derive(Debug, Clone)]
+enum PendingMutation {
+    Undo,
+    Edit { commit_id: String },
+    NewChild { commit_id: String },
+}
+
+struct DescribeInput {
+    commit_id: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +315,24 @@ struct ConfiguredLauncher {
     settings: EditorSettings,
 }
 
+impl PendingMutation {
+    fn name(&self) -> &'static str {
+        match self {
+            PendingMutation::Undo => "undo last operation",
+            PendingMutation::Edit { .. } => "edit selected change",
+            PendingMutation::NewChild { .. } => "new child from selected change",
+        }
+    }
+
+    fn command_args(&self) -> Vec<String> {
+        match self {
+            PendingMutation::Undo => vec!["undo".to_string()],
+            PendingMutation::Edit { commit_id } => vec!["edit".to_string(), commit_id.clone()],
+            PendingMutation::NewChild { commit_id } => vec!["new".to_string(), commit_id.clone()],
+        }
+    }
+}
+
 impl TuiApp {
     fn new() -> Self {
         let mut app = Self {
@@ -322,7 +354,9 @@ impl TuiApp {
             version: String::new(),
             current_head: "?".to_string(),
             observed_at: 0,
-            status: "read-only; mutations are not executed in TUI".to_string(),
+            status: "browse mode; mutations require y confirmation".to_string(),
+            pending_mutation: None,
+            describe_input: None,
         };
         app.refresh_all();
         app
@@ -669,6 +703,179 @@ impl TuiApp {
         self.status = format!("rendered {title}");
     }
 
+    fn plan_undo(&mut self) {
+        self.set_pending_mutation(PendingMutation::Undo);
+    }
+
+    fn plan_edit_selected(&mut self) {
+        let Some(commit_id) = self.selected_commit_id() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&commit_id) {
+            self.status = "cannot edit ROOT".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::Edit { commit_id });
+    }
+
+    fn plan_new_child_selected(&mut self) {
+        let Some(commit_id) = self.selected_commit_id() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&commit_id) {
+            self.status = "cannot create child from ROOT".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::NewChild { commit_id });
+    }
+
+    fn begin_describe_selected(&mut self) {
+        let Some(commit_id) = self.selected_commit_id() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&commit_id) {
+            self.status = "cannot describe ROOT".to_string();
+            return;
+        }
+        self.describe_input = Some(DescribeInput {
+            commit_id: commit_id.clone(),
+            message: String::new(),
+        });
+        self.detail_title = format!("4 Describe {}", short(&commit_id));
+        self.detail = vec![
+            "Type new description.".to_string(),
+            "Enter: apply, Esc: cancel, Backspace: delete".to_string(),
+            String::new(),
+        ];
+        self.detail_scroll = 0;
+        self.pane = UiPane::Diff;
+        self.status = "describe input".to_string();
+    }
+
+    fn push_describe_char(&mut self, ch: char) {
+        if let Some(input) = &mut self.describe_input {
+            input.message.push(ch);
+            self.render_describe_input();
+        }
+    }
+
+    fn pop_describe_char(&mut self) {
+        if let Some(input) = &mut self.describe_input {
+            input.message.pop();
+            self.render_describe_input();
+        }
+    }
+
+    fn render_describe_input(&mut self) {
+        let Some(input) = &self.describe_input else {
+            return;
+        };
+        self.detail = vec![
+            "Type new description.".to_string(),
+            "Enter: apply, Esc: cancel, Backspace: delete".to_string(),
+            String::new(),
+            input.message.clone(),
+        ];
+    }
+
+    fn cancel_describe_input(&mut self) {
+        self.describe_input = None;
+        self.status = "describe cancelled".to_string();
+    }
+
+    fn execute_describe_input(&mut self) {
+        let Some(input) = self.describe_input.take() else {
+            return;
+        };
+        if input.message.trim().is_empty() {
+            self.status = "description is empty; cancelled".to_string();
+            return;
+        }
+        let args = vec![
+            "describe".to_string(),
+            input.commit_id,
+            "-m".to_string(),
+            input.message,
+        ];
+        match execute_mutation(args.clone()) {
+            Ok(result) => {
+                let success = result.exit_code == 0;
+                if success {
+                    self.refresh_all();
+                }
+                self.detail_title = "4 Mutation describe".to_string();
+                self.detail = command_result_lines(&result);
+                self.detail_scroll = 0;
+                self.pane = UiPane::Diff;
+                self.status = if success {
+                    format!("executed jj {}", args.join(" "))
+                } else {
+                    format!("describe failed: exit {}", result.exit_code)
+                };
+            }
+            Err(error) => {
+                self.detail_title = "4 Mutation describe".to_string();
+                self.detail = vec![format!("failed to execute jj {}: {error}", args.join(" "))];
+                self.detail_scroll = 0;
+                self.status = "describe execution failed".to_string();
+            }
+        }
+    }
+
+    fn set_pending_mutation(&mut self, mutation: PendingMutation) {
+        let args = mutation.command_args();
+        self.detail_title = format!("4 Confirm {}", mutation.name());
+        self.detail = vec![
+            format!("Pending mutation: {}", mutation.name()),
+            format!("Command: jj {}", args.join(" ")),
+            "Press y to execute, Esc or n to cancel.".to_string(),
+        ];
+        self.detail_scroll = 0;
+        self.pane = UiPane::Diff;
+        self.status = "confirm mutation with y".to_string();
+        self.pending_mutation = Some(mutation);
+    }
+
+    fn cancel_pending_mutation(&mut self) {
+        self.pending_mutation = None;
+        self.status = "mutation cancelled".to_string();
+    }
+
+    fn execute_pending_mutation(&mut self) {
+        let Some(mutation) = self.pending_mutation.take() else {
+            self.status = "no pending mutation".to_string();
+            return;
+        };
+        let args = mutation.command_args();
+        let result = execute_mutation(args.clone());
+        match result {
+            Ok(result) => {
+                let success = result.exit_code == 0;
+                if success {
+                    self.refresh_all();
+                }
+                self.detail_title = format!("4 Mutation {}", mutation.name());
+                self.detail = command_result_lines(&result);
+                self.detail_scroll = 0;
+                self.pane = UiPane::Diff;
+                self.status = if success {
+                    format!("executed jj {}", args.join(" "))
+                } else {
+                    format!("mutation failed: exit {}", result.exit_code)
+                };
+            }
+            Err(error) => {
+                self.detail_title = format!("4 Mutation {}", mutation.name());
+                self.detail = vec![format!("failed to execute jj {}: {error}", args.join(" "))];
+                self.detail_scroll = 0;
+                self.status = "mutation execution failed".to_string();
+            }
+        }
+    }
+
     fn selected_editor_file(&self) -> Result<String, String> {
         let path = self.selected_file_path();
         if path.is_empty() {
@@ -745,7 +952,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 .split(body[1]);
             let left = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(5), Constraint::Length(8)])
+                .constraints([Constraint::Min(5), Constraint::Length(15)])
                 .split(body[0]);
             app.file_visible_rows = middle[1].height.saturating_sub(2).max(1) as usize;
             app.keep_selected_file_visible();
@@ -819,6 +1026,28 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        if app.describe_input.is_some() {
+            match key.code {
+                KeyCode::Enter => app.execute_describe_input(),
+                KeyCode::Esc => app.cancel_describe_input(),
+                KeyCode::Backspace => app.pop_describe_char(),
+                KeyCode::Char(ch) => app.push_describe_char(ch),
+                _ => app.status = "describe input: type, Enter apply, Esc cancel".to_string(),
+            }
+            continue;
+        }
+        if app.pending_mutation.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.execute_pending_mutation(),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    app.cancel_pending_mutation()
+                }
+                _ => {
+                    app.status = "pending mutation: press y to execute, Esc/n to cancel".to_string()
+                }
+            }
+            continue;
+        }
         let action = match key.code {
             KeyCode::Char('1') => {
                 app.pane = UiPane::Operation;
@@ -855,6 +1084,22 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                         .unwrap_or_else(|error| error),
                     Err(error) => error,
                 };
+                continue;
+            }
+            KeyCode::Char('U') => {
+                app.plan_undo();
+                continue;
+            }
+            KeyCode::Char('e') => {
+                app.plan_edit_selected();
+                continue;
+            }
+            KeyCode::Char('n') => {
+                app.plan_new_child_selected();
+                continue;
+            }
+            KeyCode::Char('d') => {
+                app.begin_describe_selected();
                 continue;
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -937,20 +1182,20 @@ fn selectable_list<'a>(
 
 fn key_pane<'a>() -> Paragraph<'a> {
     let lines = vec![
-        Line::from(Span::styled(
-            "keys",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::raw("Tab/S-Tab focus"),
-        Line::raw("1/2/3/4 panes"),
         Line::raw("j/k move/scroll"),
         Line::raw("Enter detail"),
         Line::raw("S-Enter back page"),
         Line::raw("O external editor"),
-        Line::raw("r refresh u undo"),
-        Line::raw("Ctrl-r redo R snapshot q quit"),
+        Line::raw("u preview undo"),
+        Line::raw("U undo"),
+        Line::raw("Ctrl-r redo"),
+        Line::raw("n new"),
+        Line::raw("e edit"),
+        Line::raw("d describe:conf y/Esc,n"),
+        Line::raw("r refresh"),
+        Line::raw("R snapshot"),
+        Line::raw("q quit"),
     ];
 
     Paragraph::new(lines)
@@ -1085,6 +1330,22 @@ fn run_editor_command(command: &[String], file: &str) -> Result<(), String> {
     } else {
         Err(format!("editor exited with {status}"))
     }
+}
+
+fn command_result_lines(result: &vijutsu::cli::CommandResult) -> Vec<String> {
+    let mut lines = vec![
+        format!("command: {}", result.command_display),
+        format!("exit: {}", result.exit_code),
+    ];
+    if !result.stdout.trim().is_empty() {
+        lines.push("stdout:".to_string());
+        lines.extend(result.stdout.trim().lines().map(str::to_string));
+    }
+    if !result.stderr.trim().is_empty() {
+        lines.push("stderr:".to_string());
+        lines.extend(result.stderr.trim().lines().map(str::to_string));
+    }
+    lines
 }
 
 fn spawn_new_window(settings: &EditorSettings, file: &str) -> Result<(), String> {
