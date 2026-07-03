@@ -1,0 +1,131 @@
+package = "cli"
+namespace = "vijutsu.cli"
+require = ["mod.core_domain"]
+
+[meta]
+name = "vijutsu_cli_protocol"
+version = "0.2.0"
+description = "CLI execution envelope, JSONL parse protocol, and capability probing"
+
+# ── Schemas ──
+
+[schema.CommandEnvelope]
+kind = "node"
+role = "request"
+label = "Wraps every machine-readable jj command with isolation flags"
+fields = {binary_path = "string", args = "string[]", env = "string[]", at_op = "string?", color = "string", pager = "string", quiet = "bool", config_override = "string?"}
+# Always: --color=never  --no-pager  --quiet  JJ_CONFIG=""
+# Uses --ignore-working-copy or explicit --at-op
+# -T <vijutsu-owned-template>
+
+[schema.CommandResult]
+kind = "node"
+role = "response"
+label = "Raw result of executing a jj subprocess"
+fields = {exit_code = "int", stdout = "string", stderr = "string", elapsed_ms = "int", command_display = "string"}
+
+[schema.ChangeRecord]
+kind = "node"
+role = "entity"
+label = "One JSONL record from jj log -T with Vijutsu template"
+fields = {schema_version = "int", kind = "string", source_jj_version = "string", change_id = "string", commit_id = "string", parent_commit_ids = "string[]", predecessor_commit_ids = "string[]", description = "string", bookmarks = "string[]", working_copies = "string[]", is_empty = "bool", has_conflict = "bool", is_immutable = "bool", is_hidden = "bool"}
+
+[schema.OperationRecord]
+kind = "node"
+role = "entity"
+label = "One JSONL record from jj op log -T with Vijutsu template"
+fields = {schema_version = "int", kind = "string", source_jj_version = "string", operation_id = "string", parent_operation_ids = "string[]", description = "string", timestamp_start = "string?", timestamp_end = "string?", user = "string?", host = "string?", is_current = "bool"}
+
+[schema.ParseError]
+kind = "node"
+role = "diagnostic"
+label = "Structured diagnostic when JSONL parsing fails"
+fields = {line_number = "int", raw_line = "string", error_kind = "string", message = "string"}
+
+[schema.ParseResult]
+kind = "node"
+role = "response"
+label = "Result of parsing JSONL output — may contain partial results plus errors"
+fields = {records = "schema.ChangeRecord[]", op_records = "schema.OperationRecord[]", errors = "schema.ParseError[]", raw_stdout = "string"}
+
+[schema.ProbeResult]
+kind = "node"
+role = "response"
+label = "Result of startup capability probing"
+fields = {probe_name = "string", success = "bool", raw_output = "string?", error = "string?"}
+
+# ── Funcs ──
+
+[func.buildCommandEnvelope]
+intent = "Build a command envelope with config isolation flags"
+input = ["schema.CommandEnvelope"]
+output = ["schema.CommandEnvelope"]
+design_notes = "Ensures: --color=never, --no-pager, --quiet, JJ_CONFIG=''. Uses explicit --at-op when available. Output format always specified on command line. Never depends on default revset, template, diff tool, or graph style."
+
+[func.executeJjCommand]
+intent = "Execute a jj subprocess and capture stdout/stderr separately"
+input = ["schema.CommandEnvelope"]
+output = ["schema.CommandResult"]
+design_notes = "Subprocess with separated stdout/stderr. Revset and template values passed as subprocess arguments, never via shell interpolation. No shell involved."
+
+[func.parseChangeJsonl]
+intent = "Parse JSONL stdout into ChangeRecord array with error recovery"
+input = ["schema.CommandResult"]
+output = ["schema.ParseResult"]
+design_notes = "Unknown fields: ignored. Missing required fields (schema, kind, source_jj_version): protocol error. One broken record does not panic the whole parse. Trailing text: diagnosed. UTF-8 invalid: error. Raw stdout: available for diagnosis."
+
+[func.parseOperationJsonl]
+intent = "Parse JSONL stdout into OperationRecord array with error recovery"
+input = ["schema.CommandResult"]
+output = ["schema.ParseResult"]
+design_notes = "Same resilience rules as parseChangeJsonl. Unknown schema version: explicit error (not silently ignored)."
+
+[func.probeCapability]
+intent = "Probe a single jj capability by attempting a real command"
+input = ["schema.CommandEnvelope"]
+output = ["schema.ProbeResult"]
+design_notes = "Success determined by exit code and output validation, not by version string matching."
+
+[func.detectAllCapabilities]
+intent = "Run all probes at startup to build JjCapabilities"
+input = ["vijutsu.core.schema.RepositoryInfo"]
+output = ["vijutsu.core.schema.JjCapabilities"]
+design_notes = "Sequence: jj version → template protocol probe → read-only operation query probe → change query probe → optional command help probes. Expected JSONL not returned → Mutate disabled."
+
+[func.fetchChangeGraph]
+intent = "Fetch change graph at explicit operation ID using Vijutsu-owned JSONL template"
+input = ["schema.CommandEnvelope"]
+output = ["schema.ParseResult"]
+design_notes = "Uses: --at-op=<explicit-id> --no-graph -r <explicit-revset> -T <vijutsu-template>. Does NOT use default revset. Flat records, no graph line parsing."
+
+[func.fetchOperationGraph]
+intent = "Fetch operation graph with explicit --at-op and --limit"
+input = ["schema.CommandEnvelope"]
+output = ["schema.ParseResult"]
+design_notes = "Uses: --no-graph --limit <N> -T <vijutsu-template>. Does not trigger working-copy snapshot. --ignore-working-copy or explicit --at-op."
+
+[func.fetchDiff]
+intent = "Fetch diff for a selected change lazily using explicit --git format"
+input = ["schema.CommandEnvelope"]
+output = ["schema.CommandResult"]
+design_notes = "Uses explicit diff format (--git), not user's diff tool. Parse failure does not stop graph display. File list obtained from separate query."
+
+# ── Module ──
+
+[mod.cli_protocol]
+purpose = "Isolate all jj CLI interaction behind config-safe command envelopes and JSONL parsing"
+schemas = [
+  "schema.CommandEnvelope", "schema.CommandResult",
+  "schema.ChangeRecord", "schema.OperationRecord",
+  "schema.ParseError", "schema.ParseResult",
+  "schema.ProbeResult",
+]
+funcs = [
+  "func.buildCommandEnvelope", "func.executeJjCommand",
+  "func.parseChangeJsonl", "func.parseOperationJsonl",
+  "func.probeCapability", "func.detectAllCapabilities",
+  "func.fetchChangeGraph", "func.fetchOperationGraph",
+  "func.fetchDiff",
+]
+pipeline = ["func.buildCommandEnvelope", "func.executeJjCommand", "func.parseChangeJsonl"]
+boundary = {subprocess = ["jj"]}

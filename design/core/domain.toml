@@ -1,0 +1,154 @@
+package = "core"
+namespace = "vijutsu.core"
+
+[meta]
+name = "vijutsu_core_domain"
+version = "0.2.0"
+description = "Core domain models for Vijutsu - Jujutsu visual history editor"
+
+# ── Primitive value types ──
+
+[schema.OperationId]
+kind = "value"
+role = "entity"
+label = "Hex-encoded Jujutsu operation identifier"
+fields = {hex = "string", short = "string"}
+
+[schema.ChangeId]
+kind = "value"
+role = "entity"
+label = "Hex-encoded Jujutsu change identifier (stable across rewrites)"
+fields = {hex = "string", short = "string"}
+
+[schema.CommitId]
+kind = "value"
+role = "entity"
+label = "Hex-encoded Jujutsu commit identifier (changes on rewrite)"
+fields = {hex = "string", short = "string"}
+
+[schema.TimestampRange]
+kind = "value"
+role = "entity"
+fields = {start = "timestamp?", end = "timestamp?"}
+
+[schema.Bookmark]
+kind = "node"
+role = "entity"
+fields = {name = "string", remote = "string?", is_conflicted = "bool"}
+
+[schema.ChangeFlags]
+kind = "value"
+role = "entity"
+label = "Boolean flags indicating change/commit state"
+fields = {is_empty = "bool", has_conflict = "bool", is_immutable = "bool", is_hidden = "bool", is_divergent = "bool"}
+
+# ── Graph nodes ──
+
+[schema.ChangeNode]
+kind = "node"
+role = "entity"
+label = "A node in the change graph representing a commit/change"
+fields = {change_id = "string", commit_id = "string", parent_commit_ids = "string[]", predecessor_commit_ids = "string[]", description = "string", bookmarks = "schema.Bookmark[]", workspace_names = "string[]", flags = "schema.ChangeFlags"}
+
+[schema.OperationNode]
+kind = "node"
+role = "entity"
+label = "A node in the operation graph representing one jj operation"
+fields = {operation_id = "string", parent_operation_ids = "string[]", description = "string", timestamp = "schema.TimestampRange?", user = "string?", host = "string?", is_head = "bool", is_selected = "bool"}
+
+[schema.ChangeGraph]
+kind = "node"
+role = "entity"
+label = "DAG of ChangeNodes constructed from parent_commit_ids"
+fields = {nodes = "schema.ChangeNode[]", root_ids = "string[]"}
+
+[schema.OperationGraph]
+kind = "node"
+role = "entity"
+label = "DAG of OperationNodes constructed from parent_operation_ids"
+fields = {nodes = "schema.OperationNode[]", head_ids = "string[]"}
+
+# ── OperationDelta components ──
+
+[schema.RewritePair]
+kind = "value"
+role = "event"
+label = "Same change ID with different commit ID across two snapshots"
+fields = {change_id = "string", old_commit_id = "string", new_commit_id = "string"}
+
+[schema.ParentChange]
+kind = "value"
+role = "event"
+label = "A commit whose parent list changed between snapshots (rebase, etc.)"
+fields = {commit_id = "string", old_parents = "string[]", new_parents = "string[]"}
+
+[schema.BookmarkMove]
+kind = "value"
+role = "event"
+fields = {name = "string", old_target = "string?", new_target = "string?"}
+
+[schema.WorkspaceMove]
+kind = "value"
+role = "event"
+fields = {workspace = "string", old_commit_id = "string?", new_commit_id = "string?"}
+
+[schema.ConflictTransition]
+kind = "value"
+role = "event"
+fields = {commit_id = "string", had_conflict = "bool", has_conflict = "bool"}
+
+[schema.OperationDelta]
+kind = "node"
+role = "entity"
+label = "Difference between two operation snapshots computed by internal graph diff"
+fields = {from_op = "string", to_op = "string", added_commits = "string[]", removed_commits = "string[]", rewritten_changes = "schema.RewritePair[]", parent_changes = "schema.ParentChange[]", moved_bookmarks = "schema.BookmarkMove[]", workspace_moves = "schema.WorkspaceMove[]", conflict_transitions = "schema.ConflictTransition[]"}
+
+# ── Observation model ──
+
+[schema.ObservationFreshness]
+kind = "value"
+role = "context"
+label = "How fresh the current observation is relative to filesystem and operation head state"
+fields = {state = "string", changed_paths_known = "bool?", stale_operation_id = "string?"}
+# state ∈ {current_snapshot, filesystem_ahead, operation_head_changed, historical, stale_working_copy, unknown}
+
+[schema.ObservationToken]
+kind = "value"
+role = "context"
+label = "Token ensuring all panes in a single screen share the same observation point"
+fields = {operation_id = "string", head_set_hash = "string", observed_at = "timestamp"}
+
+[schema.RepositoryObservation]
+kind = "node"
+role = "context"
+label = "A complete snapshot of what Vijutsu observes from Jujutsu at a given moment"
+fields = {observed_at = "timestamp", selected_operation_id = "string", operation_heads = "string[]", operation_graph = "schema.OperationGraph", change_graph = "schema.ChangeGraph", freshness = "schema.ObservationFreshness", token = "schema.ObservationToken"}
+
+# ── Capability model ──
+
+[schema.JjCapabilities]
+kind = "node"
+role = "config"
+label = "Detected capabilities of the jj binary based on probing, not version number guessing"
+fields = {version = "string", json_template_function = "bool", escape_json_method = "bool", operation_parent_template = "bool", commit_predecessor_template = "bool", op_diff = "bool", op_show = "bool", op_revert = "bool", op_restore = "bool", op_restore_what = "bool", redo = "bool", util_snapshot = "bool", no_integrate_operation = "bool"}
+
+[schema.RepositoryInfo]
+kind = "node"
+role = "context"
+label = "Basic info about the repository detected at startup"
+fields = {repo_path = "string", workspace_name = "string", jj_version = "string", capabilities = "schema.JjCapabilities"}
+
+# ── Module ──
+
+[mod.core_domain]
+purpose = "Core domain types shared across all Vijutsu subsystems"
+schemas = [
+  "schema.OperationId", "schema.ChangeId", "schema.CommitId",
+  "schema.TimestampRange", "schema.Bookmark", "schema.ChangeFlags",
+  "schema.ChangeNode", "schema.OperationNode",
+  "schema.ChangeGraph", "schema.OperationGraph",
+  "schema.RewritePair", "schema.ParentChange", "schema.BookmarkMove",
+  "schema.WorkspaceMove", "schema.ConflictTransition", "schema.OperationDelta",
+  "schema.ObservationFreshness", "schema.ObservationToken", "schema.RepositoryObservation",
+  "schema.JjCapabilities", "schema.RepositoryInfo",
+]

@@ -1,0 +1,35 @@
+[project]
+name = "vijutsu"
+description = "Jujutsuのchange graphとoperation graphを差分付きで観測・編集する視覚的履歴エディタ"
+
+[paths]
+ir_root = "design"
+
+[packages.core]
+root = "design/core"
+namespace = "vijutsu.core"
+
+[packages.cli]
+root = "design/cli"
+namespace = "vijutsu.cli"
+depends = ["core"]
+
+[packages.observation]
+root = "design/observation"
+namespace = "vijutsu.observation"
+depends = ["core", "cli"]
+
+[packages.watcher]
+root = "design/watcher"
+namespace = "vijutsu.watcher"
+depends = ["core", "observation"]
+
+[packages.tui]
+root = "design/tui"
+namespace = "vijutsu.tui"
+depends = ["core", "observation", "watcher", "mutation"]
+
+[packages.mutation]
+root = "design/mutation"
+namespace = "vijutsu.mutation"
+depends = ["core", "cli", "observation"]

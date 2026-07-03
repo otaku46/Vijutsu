@@ -1,0 +1,183 @@
+package = "tui"
+namespace = "vijutsu.tui"
+require = ["mod.observation_engine", "mod.watcher", "mod.mutation_engine"]
+
+[meta]
+name = "vijutsu_tui"
+version = "0.2.0"
+description = "Terminal UI: layout, rendering, key handling, and preview display"
+
+# ── Schemas ──
+
+[schema.RepoHeader]
+kind = "node"
+role = "context"
+label = "Repository header bar showing repo/workspace/version/status"
+fields = {repo_name = "string", workspace = "string", jj_version = "string", head_count = "int", snapshot_state = "string", freshness_label = "string"}
+# freshness_label examples:
+#   "current snapshot"
+#   "filesystem has newer changes"
+#   "Historical view  Operation: abc123  Working-copy filesystem is not reflected"
+
+[schema.OperationPane]
+kind = "node"
+role = "context"
+label = "Operation graph pane showing operation DAG"
+fields = {nodes = "vijutsu.core.schema.OperationNode[]", selected_index = "int", head_count = "int", limit = "int", limit_reached = "bool", view_mode = "string"}
+# view_mode ∈ {current, historical}
+# Markers:  @  selected observation operation
+#           ◆  operation head
+#           ◎  working-copy workspace referenced operation
+# These markers are always distinct — @ ≠ ◆ ≠ ◎
+
+[schema.ChangePane]
+kind = "node"
+role = "context"
+label = "Change graph pane showing change DAG at selected operation"
+fields = {nodes = "vijutsu.core.schema.ChangeNode[]", selected_index = "int", view_mode = "string", projection_label = "string?"}
+# view_mode ∈ {current, historical}
+# When historical:  "Viewing operation: <id>   Mode: read-only historical view"
+# Shows: change_id, commit_id, parents, bookmarks, workspace, description
+#        empty, conflict, immutable, divergent markers
+
+[schema.FileEntry]
+kind = "node"
+role = "entity"
+fields = {path = "string", status = "string"}
+# status ∈ {M, A, D, R}
+
+[schema.FilesPane]
+kind = "node"
+role = "context"
+label = "File list for the selected change"
+fields = {files = "schema.FileEntry[]", selected_index = "int"}
+
+[schema.DiffPane]
+kind = "node"
+role = "context"
+label = "Diff or operation delta display pane"
+fields = {content = "string", display_mode = "string", is_loading = "bool"}
+# display_mode ∈ {file_diff, operation_delta}
+
+[schema.Layout]
+kind = "node"
+role = "context"
+label = "Top-level TUI layout with 4 panes plus header"
+fields = {repo_header = "schema.RepoHeader", operation_pane = "schema.OperationPane", change_pane = "schema.ChangePane", files_pane = "schema.FilesPane", diff_pane = "schema.DiffPane", active_pane = "string", terminal_width = "int", terminal_height = "int", is_narrow = "bool"}
+# Narrow terminals → tab-style layout instead of multi-pane grid
+
+[schema.RevsetInput]
+kind = "node"
+role = "request"
+label = "User-entered revset expression for filtering change graph"
+fields = {expression = "string", is_valid = "bool?", error_message = "string?", recent_history = "string[]"}
+# Input value passed directly as subprocess argument, never through shell.
+# Parse errors displayed inline. Session history maintained. Default restorable.
+# Revset change is treated as Inspect (no mutation).
+
+[schema.OperationLimitInput]
+kind = "node"
+role = "config"
+label = "User-configurable operation history limit"
+fields = {current_limit = "int", limit_reached = "bool", default_limit = "int"}
+# Initial value is finite. Shows indicator when limit reached.
+# "More operations available" — never implies old operations don't exist.
+
+[schema.KeyAction]
+kind = "node"
+role = "event"
+label = "Mapped key press to action"
+fields = {key = "string", action = "string", scope = "string"}
+# scope ∈ {graph_navigation, pane_navigation, command}
+# h/l: graph parent/child movement ONLY  — never pane switch
+# Tab/Shift-Tab: pane switch ONLY
+
+[schema.CommandLogEntry]
+kind = "node"
+role = "diagnostic"
+fields = {command = "string", exit_code = "int", stdout_preview = "string", stderr_preview = "string", timestamp = "timestamp"}
+
+[schema.CommandLog]
+kind = "node"
+role = "diagnostic"
+label = "Log of executed jj commands and their results for user inspection"
+fields = {entries = "schema.CommandLogEntry[]"}
+
+[schema.PreviewPanel]
+kind = "node"
+role = "context"
+label = "Preview panel for mutation operations before execution — always shows six dimensions"
+fields = {title = "string", change_graph_effect = "string", operation_graph_effect = "string", working_copy_effect = "string", bookmark_effect = "string", remote_tracking_effect = "string", recoverability_effect = "string", is_confirmed = "bool"}
+# Six dimensions displayed before any mutation:
+#   Change graph:     changes / unchanged
+#   Operation graph:  node add / remove / reconnect
+#   Working copy:     rewritten / unchanged
+#   Bookmarks:        moved / unchanged
+#   Remote tracking:  changed / unchanged / unknown
+#   Recoverability:   maintained / reduced / GC-risk
+
+# ── Funcs ──
+
+[func.renderLayout]
+intent = "Render the full TUI layout from the current observation and selection state"
+input = ["vijutsu.core.schema.RepositoryObservation", "vijutsu.observation.schema.SelectionState"]
+output = ["schema.Layout"]
+design_notes = "All panes share the same ObservationToken. Pane data from different observation points is discarded. Narrow terminal → tab layout. Never mixes information from different operations within one screen."
+
+[func.handleKeyInput]
+intent = "Map key press to action and dispatch to appropriate handler"
+input = ["schema.KeyAction"]
+output = ["schema.KeyAction"]
+design_notes = "j/k: graph prev/next. h/l: graph parent/child. Tab/S-Tab: pane switch. Enter: detail. Space: pin comparison. /: revset. [/]: operation limit. r: read-only refresh. R: snapshot refresh. u: undo preview. Ctrl-r: redo preview. s: squash preview. b: rebase preview. o: operation focus. v: revert preview. t: restore preview. a: abandon preview. :: command palette. ?: help. q: quit."
+
+[func.renderPreview]
+intent = "Render the two-tier preview panel showing effects of a planned mutation"
+input = ["schema.PreviewPanel"]
+output = ["schema.PreviewPanel"]
+design_notes = "Shows all six effect dimensions. User must confirm before execution. No mutation without preview."
+
+[func.renderFreshnessIndicator]
+intent = "Render the snapshot freshness indicator in the header"
+input = ["vijutsu.core.schema.ObservationFreshness"]
+output = ["schema.RepoHeader"]
+design_notes = "Must distinguish: current snapshot vs filesystem ahead vs historical view. Inspect mode never implies live filesystem state."
+
+[func.renderMultipleHeads]
+intent = "Render the multiple operation heads selection UI"
+input = ["vijutsu.watcher.schema.MultipleHeadsView"]
+output = ["schema.OperationPane"]
+design_notes = "Shows each head with description. 'No operation was integrated. Select a head to inspect.' Never shows a single merged virtual state."
+
+[func.handleRevsetInput]
+intent = "Process revset input: validate, pass as subprocess argument, display errors"
+input = ["schema.RevsetInput"]
+output = ["schema.RevsetInput"]
+design_notes = "Treated as Inspect. Input never passed through shell. Parse errors shown in-UI. Recent revsets kept in session. Default revset restorable."
+
+# ── Module ──
+
+[mod.tui]
+purpose = "Terminal user interface: layout, rendering, key handling, and preview display"
+submods = ["render", "input"]
+schemas = [
+  "schema.RepoHeader", "schema.OperationPane", "schema.ChangePane",
+  "schema.FileEntry", "schema.FilesPane", "schema.DiffPane",
+  "schema.Layout", "schema.RevsetInput", "schema.OperationLimitInput",
+  "schema.KeyAction", "schema.CommandLogEntry", "schema.CommandLog",
+  "schema.PreviewPanel",
+]
+funcs = [
+  "func.renderLayout", "func.handleKeyInput",
+  "func.renderPreview", "func.renderFreshnessIndicator",
+  "func.renderMultipleHeads", "func.handleRevsetInput",
+]
+pipeline = ["func.handleKeyInput", "func.renderLayout", "func.renderFreshnessIndicator"]
+boundary = {terminal = ["stdin", "stdout"]}
+
+[mod.tui.render]
+purpose = "Rendering engine for all panes and preview panels"
+funcs = ["func.renderLayout", "func.renderPreview", "func.renderFreshnessIndicator", "func.renderMultipleHeads"]
+
+[mod.tui.input]
+purpose = "Key input mapping and dispatch"
+funcs = ["func.handleKeyInput", "func.handleRevsetInput"]

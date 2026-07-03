@@ -1,0 +1,132 @@
+package = "observation"
+namespace = "vijutsu.observation"
+require = ["mod.cli_protocol"]
+
+[meta]
+name = "vijutsu_observation_engine"
+version = "0.2.0"
+description = "Observation engine: acquires, validates, and manages repository state observations with TOCTOU safety"
+
+# ── Schemas ──
+
+[schema.SelectionState]
+kind = "node"
+role = "context"
+label = "Current user selection state in both panes"
+fields = {selected_op_id = "string?", selected_change_id = "string?", selected_commit_id = "string?", comparison_op_id = "string?"}
+
+[schema.OperationSelectionRestore]
+kind = "node"
+role = "context"
+label = "Strategy for restoring operation pane selection after refresh"
+fields = {priority = "int", strategy = "string"}
+# Strategies in priority order:
+#  1. same_op_id
+#  2. descendant_of_selected
+#  3. parent_of_selected
+#  4. last_screen_position
+#  5. explicit_current_head
+#  6. safe_default
+
+[schema.ChangeSelectionRestore]
+kind = "node"
+role = "context"
+label = "Strategy for restoring change pane selection after refresh"
+fields = {priority = "int", strategy = "string"}
+# Strategies in priority order:
+#  1. same_change_and_commit
+#  2. same_change_id
+#  3. same_commit_id
+#  4. rewrite_predecessor_successor
+#  5. parent_change
+#  6. last_screen_position
+#  7. working_copy_change
+#  8. safe_default
+# Divergent changes: show candidates, do not auto-pick by change_id alone
+
+[schema.HeadValidation]
+kind = "node"
+role = "context"
+label = "Result of TOCTOU check comparing head sets before and after graph fetch"
+fields = {heads_before = "string[]", heads_after = "string[]", is_consistent = "bool", retry_count = "int"}
+
+[schema.RefreshRequest]
+kind = "node"
+role = "request"
+label = "A request to refresh the observation"
+fields = {trigger = "string", is_snapshot = "bool", requested_at = "timestamp"}
+# trigger ∈ {user_manual, op_head_change, fs_change, mutate_complete,
+#             terminal_focus, poll_interval, post_parse_head_change}
+
+[schema.DeltaComparisonView]
+kind = "node"
+role = "response"
+label = "UI-ready view of an OperationDelta comparison between two operations"
+fields = {from_op = "string", to_op = "string", added = "string[]", removed = "string[]", rewritten = "string[]", parent_changed = "string[]", bookmarks_moved = "string[]", conflicts_changed = "string[]"}
+
+# ── Funcs ──
+
+[func.acquireObservation]
+intent = "Acquire a complete repository observation at an explicit operation ID with TOCTOU validation"
+input = ["schema.RefreshRequest"]
+output = ["vijutsu.core.schema.RepositoryObservation"]
+design_notes = "Steps: 1) fetch head set H1, 2) fetch op graph at explicit ID, 3) fetch change graph at explicit ID, 4) fetch head set H2, 5) if H1≠H2 mark stale and retry (bounded). High-frequency changes → keep old screen + 'repository changing' indicator."
+
+[func.resolveOperationSelection]
+intent = "Restore the operation pane selection after a refresh using the priority cascade"
+input = ["schema.SelectionState", "vijutsu.core.schema.OperationGraph"]
+output = ["schema.SelectionState"]
+design_notes = "Priority: same op ID → descendant → parent → screen position → current head → safe default."
+
+[func.resolveChangeSelection]
+intent = "Restore the change pane selection after a refresh using the priority cascade"
+input = ["schema.SelectionState", "vijutsu.core.schema.ChangeGraph"]
+output = ["schema.SelectionState"]
+design_notes = "Priority: same change+commit → same change → same commit → rewrite predecessor/successor → parent change → screen position → working-copy change → safe default. Divergent changes show candidate list."
+
+[func.computeOperationDelta]
+intent = "Compute OperationDelta by comparing two ChangeGraph snapshots fetched at explicit operation IDs"
+input = ["vijutsu.core.schema.ChangeGraph", "vijutsu.core.schema.ChangeGraph"]
+output = ["vijutsu.core.schema.OperationDelta"]
+design_notes = "Primary method: snapshot comparison. Comparison keys: commit_id, change_id, predecessor relation, parent_commit_ids, bookmark target, workspace target, conflict/empty state. jj op diff used for human display and validation only, not as primary IR source."
+
+[func.checkFreshness]
+intent = "Determine ObservationFreshness by comparing filesystem state and operation heads"
+input = ["vijutsu.core.schema.RepositoryObservation"]
+output = ["vijutsu.core.schema.ObservationFreshness"]
+design_notes = "Distinguishes: current_snapshot, filesystem_ahead, operation_head_changed, historical, stale_working_copy, unknown."
+
+[func.validateHeadConsistency]
+intent = "Perform TOCTOU check: compare head sets before and after graph acquisition"
+input = ["schema.HeadValidation"]
+output = ["schema.HeadValidation"]
+design_notes = "If inconsistent, observation is marked stale. Retry has upper bound. High-frequency changes → 'repository changing' indicator."
+
+[func.buildDeltaComparisonView]
+intent = "Transform a raw OperationDelta into a UI-ready comparison view"
+input = ["vijutsu.core.schema.OperationDelta"]
+output = ["schema.DeltaComparisonView"]
+
+# ── Module ──
+
+[mod.observation_engine]
+purpose = "Acquire, validate, and manage complete repository observations with TOCTOU safety and selection restoration"
+submods = ["delta"]
+schemas = [
+  "schema.SelectionState",
+  "schema.OperationSelectionRestore", "schema.ChangeSelectionRestore",
+  "schema.HeadValidation", "schema.RefreshRequest",
+  "schema.DeltaComparisonView",
+]
+funcs = [
+  "func.acquireObservation",
+  "func.resolveOperationSelection", "func.resolveChangeSelection",
+  "func.computeOperationDelta", "func.checkFreshness",
+  "func.validateHeadConsistency", "func.buildDeltaComparisonView",
+]
+pipeline = ["func.acquireObservation", "func.checkFreshness", "func.resolveOperationSelection", "func.resolveChangeSelection"]
+
+[mod.observation_engine.delta]
+purpose = "OperationDelta computation via snapshot comparison"
+funcs = ["func.computeOperationDelta", "func.buildDeltaComparisonView"]
+pipeline = ["func.computeOperationDelta", "func.buildDeltaComparisonView"]

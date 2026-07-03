@@ -1,0 +1,163 @@
+package = "mutation"
+namespace = "vijutsu.mutation"
+require = ["mod.cli_protocol", "mod.observation_engine"]
+
+[meta]
+name = "vijutsu_mutation_operations"
+version = "0.2.0"
+description = "Mutation operations: undo, redo, restore, revert, abandon with two-tier preview and capability-aware degradation"
+
+# ── Schemas ──
+
+[schema.UndoPreview]
+kind = "node"
+role = "response"
+label = "Preview of undo effects before execution"
+fields = {target_operation = "string", inverse_delta = "vijutsu.core.schema.OperationDelta", new_operation_will_be_added = "bool", warnings = "string[]"}
+
+[schema.RedoPreview]
+kind = "node"
+role = "response"
+label = "Preview of redo effects — only available when capability exists"
+fields = {target_operation = "string", forward_delta = "vijutsu.core.schema.OperationDelta", is_available = "bool", unavailable_reason = "string?"}
+# If jj does not support redo:
+#   "Redo is not supported by this Jujutsu version."
+#   Redo key disabled. op restore suggested as alternative.
+#   Vijutsu never implements its own redo.
+
+[schema.RestorePreview]
+kind = "node"
+role = "response"
+label = "Preview comparing current state with restore target state"
+fields = {target_operation = "string", current_graph = "vijutsu.core.schema.ChangeGraph", target_graph = "vijutsu.core.schema.ChangeGraph", delta = "vijutsu.core.schema.OperationDelta", warnings = "string[]"}
+# Mandatory warnings:
+#   "Later operations will not be deleted."
+#   "The working copy may be rewritten."
+#   "A new restore operation will be created."
+
+[schema.RevertPreview]
+kind = "node"
+role = "response"
+label = "Preview of reverting a single operation's effects on current state"
+fields = {target_operation = "string", inverse_effect = "vijutsu.core.schema.OperationDelta", warnings = "string[]"}
+# Must explain restore vs revert:
+#   Restore: recovers entire view at target point
+#   Revert:  applies inverse of one operation to current state
+
+[schema.AbandonPreview]
+kind = "node"
+role = "response"
+label = "Preview of abandoning operations from history"
+fields = {target_operations = "string[]", history_changes = "bool", current_view_changes = "bool", objects_become_unreachable = "bool", immediate_deletion = "bool", gc_deletion_possible = "bool", warnings = "string[]"}
+# Mandatory display — five effect dimensions:
+#   Operation history changed:       YES
+#   Current view expected to change:  NO
+#   Objects may become unreachable:   YES
+#   Immediate physical deletion:      NO
+#   Deletion after garbage collection: POSSIBLE
+# Never states GC will definitely delete.
+# Current-operation ranges blocked from direct abandon.
+# MVP: preview-only, or experimental flag, or detailed confirmation.
+
+[schema.HeadIntegrationPreview]
+kind = "node"
+role = "response"
+label = "Preview of merging multiple operation heads"
+fields = {source_heads = "string[]", predicted_change_graph = "vijutsu.core.schema.ChangeGraph?", is_preview_available = "bool", fallback_instructions = "string?"}
+# Never auto-integrated as side effect of Inspect.
+# If no merge capability: show CLI fallback instructions only.
+
+[schema.MutationResult]
+kind = "node"
+role = "response"
+label = "Result of executing a mutation — triggers full re-observation"
+fields = {command_executed = "string", exit_code = "int", stderr = "string", success = "bool", new_observation = "vijutsu.core.schema.RepositoryObservation?"}
+
+[schema.SnapshotRefreshResult]
+kind = "node"
+role = "response"
+label = "Result of explicit snapshot refresh (jj util snapshot)"
+fields = {new_operation_created = "bool", new_operation_id = "string?", pre_warning_shown = "bool"}
+# Before execution, warns user that a new operation may be created.
+# Uses jj util snapshot or equivalent detected capability.
+
+# ── Funcs ──
+
+[func.previewUndo]
+intent = "Generate undo preview showing target operation and inverse delta"
+input = ["vijutsu.core.schema.RepositoryObservation"]
+output = ["schema.UndoPreview"]
+design_notes = "Shows: target op, inverse change graph diff, new operation will be added. Triggers full state re-acquisition after execution."
+
+[func.previewRedo]
+intent = "Generate redo preview if capability exists, otherwise show degradation message"
+input = ["vijutsu.core.schema.RepositoryObservation", "vijutsu.core.schema.JjCapabilities"]
+output = ["schema.RedoPreview"]
+design_notes = "If redo capability false: show unavailable message, disable redo key, suggest op restore as alternative. Never implement custom redo."
+
+[func.previewRestore]
+intent = "Generate restore preview comparing current and target operation states"
+input = ["vijutsu.core.schema.RepositoryObservation", "vijutsu.core.schema.OperationNode"]
+output = ["schema.RestorePreview"]
+design_notes = "Fetches change graph at both current head and target op with explicit --at-op. Shows side-by-side comparison. Warnings: later ops stay in log, working copy may rewrite, new restore op created."
+
+[func.previewRevert]
+intent = "Generate revert preview showing inverse of a single operation applied to current state"
+input = ["vijutsu.core.schema.RepositoryObservation", "vijutsu.core.schema.OperationNode"]
+output = ["schema.RevertPreview"]
+design_notes = "Explains restore vs revert difference in preview panel."
+
+[func.previewAbandon]
+intent = "Generate abandon preview with full recoverability impact display"
+input = ["vijutsu.core.schema.OperationNode[]"]
+output = ["schema.AbandonPreview"]
+design_notes = "MVP: preview-only or experimental flag. Blocks abandon of current-op ranges. Shows five effect dimensions. Does not claim certainty about GC behavior."
+
+[func.previewHeadIntegration]
+intent = "Generate preview of merging divergent operation heads"
+input = ["vijutsu.watcher.schema.MultipleHeadsView"]
+output = ["schema.HeadIntegrationPreview"]
+design_notes = "Independent explicit operation, never Inspect side-effect. If no merge capability, show CLI fallback instructions."
+
+[func.executeMutation]
+intent = "Execute a confirmed mutation command and trigger full state re-acquisition"
+input = ["vijutsu.cli.schema.CommandEnvelope"]
+output = ["schema.MutationResult"]
+design_notes = "After execution: full re-acquire observation, update all panes, restore selection via priority cascade."
+
+[func.executeSnapshotRefresh]
+intent = "Execute explicit snapshot refresh via jj util snapshot with pre-warning"
+input = ["vijutsu.core.schema.JjCapabilities"]
+output = ["schema.SnapshotRefreshResult"]
+design_notes = "Warns user before execution that new operation may be created. Uses detected capability."
+
+# ── Module ──
+
+[mod.mutation_engine]
+purpose = "Preview and execute mutation operations with two-tier effect display and capability-aware degradation"
+submods = ["preview", "execute"]
+schemas = [
+  "schema.UndoPreview", "schema.RedoPreview",
+  "schema.RestorePreview", "schema.RevertPreview",
+  "schema.AbandonPreview", "schema.HeadIntegrationPreview",
+  "schema.MutationResult", "schema.SnapshotRefreshResult",
+]
+funcs = [
+  "func.previewUndo", "func.previewRedo",
+  "func.previewRestore", "func.previewRevert",
+  "func.previewAbandon", "func.previewHeadIntegration",
+  "func.executeMutation", "func.executeSnapshotRefresh",
+]
+pipeline = ["func.previewUndo", "func.executeMutation"]
+
+[mod.mutation_engine.preview]
+purpose = "Generate mutation previews with two-tier effect analysis"
+funcs = [
+  "func.previewUndo", "func.previewRedo",
+  "func.previewRestore", "func.previewRevert",
+  "func.previewAbandon", "func.previewHeadIntegration",
+]
+
+[mod.mutation_engine.execute]
+purpose = "Execute confirmed mutations and trigger full state re-acquisition"
+funcs = ["func.executeMutation", "func.executeSnapshotRefresh"]

@@ -1,0 +1,107 @@
+package = "watcher"
+namespace = "vijutsu.watcher"
+require = ["mod.observation_engine"]
+
+[meta]
+name = "vijutsu_watchers"
+version = "0.2.0"
+description = "File and operation head watchers for detecting external changes"
+
+# ── Schemas ──
+
+[schema.WatchEvent]
+kind = "node"
+role = "event"
+label = "A detected external change event"
+fields = {event_type = "string", source = "string", detected_at = "timestamp", paths = "string[]?"}
+# event_type ∈ {op_head_change, fs_change, terminal_focus, poll_timeout}
+# source     ∈ {file_backend, polling, fs_watcher, terminal}
+
+[schema.WatcherConfig]
+kind = "node"
+role = "config"
+label = "Configuration for watcher behavior"
+fields = {debounce_ms = "int", poll_interval_ms = "int", max_retry = "int", use_file_backend = "bool"}
+# debounce: 100–500ms. Refresh serialized. Stale async results discarded.
+# Watcher events alone do not confirm snapshot state.
+
+[schema.WatcherState]
+kind = "node"
+role = "context"
+label = "Current state of the watcher subsystem"
+fields = {active_watcher = "string", last_known_heads = "string[]", last_event_at = "timestamp?", pending_refresh = "bool"}
+
+[schema.MultipleHeadsView]
+kind = "node"
+role = "response"
+label = "UI representation when multiple operation heads are detected"
+fields = {head_count = "int", heads = "vijutsu.core.schema.OperationNode[]", message = "string", selected_head = "string?"}
+# Never implicitly merge heads. Display each head with description.
+# User must explicitly select one for inspection.
+# Example display:
+#   Operation heads: 2
+#   ◆ op-a  terminal-1: squash
+#   ◆ op-b  agent-2: describe
+#   No operation was integrated. Select a head to inspect.
+
+# ── Funcs ──
+
+[func.watchOperationHeads]
+intent = "Monitor operation head directory/state for changes from external jj processes"
+input = ["schema.WatcherConfig"]
+output = ["schema.WatchEvent"]
+design_notes = "Checks .jj/repo/op_heads/heads for file backend. Falls back to polling if file watching unavailable. Watched path is a signal only — never reads repo state directly from it. Backend type read from .jj/repo/op_heads/type."
+
+[func.watchFilesystem]
+intent = "Monitor working copy filesystem for changes indicating unsnapshot edits"
+input = ["schema.WatcherConfig"]
+output = ["schema.WatchEvent"]
+design_notes = "100–500ms debounce. Merges burst editor saves into single event. Changed paths are auxiliary info only. Does not confirm snapshot status from watcher event alone."
+
+[func.handleWatchEvent]
+intent = "Process a watch event and determine whether to trigger a refresh"
+input = ["schema.WatchEvent", "schema.WatcherState"]
+output = ["vijutsu.observation.schema.RefreshRequest"]
+design_notes = "Serializes refresh processing. Discards stale async results. Coalesces rapid events."
+
+[func.detectMultipleHeads]
+intent = "Enumerate operation heads without triggering implicit merge"
+input = ["vijutsu.core.schema.OperationGraph"]
+output = ["schema.MultipleHeadsView"]
+design_notes = "Uses non-merging Inspect query. Displays each head separately. Never runs implicit integration. User picks head for --at-op=<explicit-id>."
+
+[func.fallbackToPolling]
+intent = "Switch from file backend watcher to polling when file watching fails"
+input = ["schema.WatcherState"]
+output = ["schema.WatcherState"]
+design_notes = "Runs explicit Inspect query at poll interval. Compares operation head ID set for changes."
+
+# ── Module ──
+
+[mod.watcher]
+purpose = "Detect external changes to operation heads and working copy filesystem, trigger observation refresh"
+submods = ["op_head", "filesystem"]
+schemas = [
+  "schema.WatchEvent", "schema.WatcherConfig",
+  "schema.WatcherState", "schema.MultipleHeadsView",
+]
+funcs = [
+  "func.watchOperationHeads", "func.watchFilesystem",
+  "func.handleWatchEvent", "func.detectMultipleHeads",
+  "func.fallbackToPolling",
+]
+pipeline = [
+  {parallel = ["func.watchOperationHeads", "func.watchFilesystem"]},
+  "func.handleWatchEvent",
+]
+boundary = {filesystem = [".jj/repo/op_heads/", "working copy"]}
+
+[mod.watcher.op_head]
+purpose = "Operation head change detection via FileBackendWatcher or PollingWatcher"
+funcs = ["func.watchOperationHeads", "func.detectMultipleHeads", "func.fallbackToPolling"]
+pipeline = ["func.watchOperationHeads", "func.detectMultipleHeads"]
+
+[mod.watcher.filesystem]
+purpose = "Working copy filesystem change detection with debounce"
+funcs = ["func.watchFilesystem"]
+pipeline = ["func.watchFilesystem"]
