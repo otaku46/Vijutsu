@@ -1,6 +1,5 @@
-use std::fs;
+use std::collections::BTreeSet;
 use std::io;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -14,10 +13,10 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use vijutsu::cli::{
     ParseError, ParseResult, detect_capabilities, execute_snapshot_refresh, fetch_bookmark_list,
@@ -25,6 +24,7 @@ use vijutsu::cli::{
     fetch_operation_records, jj_version,
 };
 use vijutsu::core::{JjCapabilities, ObservationFreshness};
+use vijutsu::editor::{ConfiguredLauncher, OpenRequest, TerminalLauncher, load_editor_settings};
 use vijutsu::graph::{GraphCharset, GraphNode, render_graph_rows};
 use vijutsu::mutation::{
     RestorePreview, RevertPreview, UndoPreview, abandon_preview, execute_mutation, redo_preview,
@@ -44,6 +44,7 @@ use vijutsu::tui::{
     preview_panel_for_revert, preview_panel_for_snapshot_refresh, preview_panel_for_undo,
     render_keys, render_multiple_heads, render_observation, render_preview_panel,
 };
+use vijutsu::tui_runtime::{focused_block, selectable_list, styled_lines, visible_from};
 use vijutsu::watcher::{
     WatcherState, detect_filesystem_change, detect_multiple_heads, detect_operation_head_change,
     scan_filesystem, update_watcher_state,
@@ -265,9 +266,16 @@ struct TuiApp {
     files: Vec<TuiFile>,
     detail_title: String,
     detail: Vec<String>,
+    overlay: Option<OverlayPane>,
     selected_operation: usize,
     selected_change: usize,
     selected_file: usize,
+    selected_files: BTreeSet<usize>,
+    file_selection_anchor: Option<usize>,
+    operation_scroll: usize,
+    operation_visible_rows: usize,
+    change_scroll: usize,
+    change_visible_rows: usize,
     file_scroll: usize,
     file_visible_rows: usize,
     detail_scroll: u16,
@@ -275,11 +283,25 @@ struct TuiApp {
     current_head: String,
     observed_at: u64,
     status: String,
+    command_log: Vec<CommandLogEntry>,
+    pinned_change: Option<SelectedChange>,
     pending_mutation: Option<PendingMutation>,
     describe_input: Option<DescribeInput>,
     commit_input: Option<CommitInput>,
     bookmark_input: Option<BookmarkInput>,
     rebase_source: Option<SelectedChange>,
+}
+
+struct OverlayPane {
+    title: String,
+    lines: Vec<String>,
+    scroll: u16,
+}
+
+struct CommandLogEntry {
+    command: String,
+    exit_code: Option<i32>,
+    status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,33 +393,6 @@ struct CommitInput {
 struct BookmarkInput {
     change: SelectedChange,
     name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenPlacement {
-    CurrentTerminal,
-    NewPane,
-    NewTab,
-    NewWindow,
-}
-
-struct OpenRequest {
-    file: String,
-    placement: OpenPlacement,
-}
-
-trait TerminalLauncher {
-    fn open_editor(&self, request: OpenRequest) -> Result<(), String>;
-}
-
-struct EditorSettings {
-    command: Vec<String>,
-    placement: OpenPlacement,
-    launcher: String,
-}
-
-struct ConfiguredLauncher {
-    settings: EditorSettings,
 }
 
 impl PendingMutation {
@@ -698,9 +693,16 @@ impl TuiApp {
                 "Enter: show focused item here".to_string(),
                 "u: undo preview  Ctrl-r: redo preview  R: snapshot preview".to_string(),
             ],
+            overlay: None,
             selected_operation: 0,
             selected_change: 0,
             selected_file: 0,
+            selected_files: BTreeSet::new(),
+            file_selection_anchor: None,
+            operation_scroll: 0,
+            operation_visible_rows: 1,
+            change_scroll: 0,
+            change_visible_rows: 1,
             file_scroll: 0,
             file_visible_rows: 1,
             detail_scroll: 0,
@@ -708,6 +710,8 @@ impl TuiApp {
             current_head: "?".to_string(),
             observed_at: 0,
             status: "browse mode; mutations require y confirmation".to_string(),
+            command_log: Vec::new(),
+            pinned_change: None,
             pending_mutation: None,
             describe_input: None,
             commit_input: None,
@@ -787,6 +791,7 @@ impl TuiApp {
                 path: String::new(),
                 label: "ROOT has no file diff".to_string(),
             }];
+            self.select_file(0, false, false);
             self.detail = vec!["ROOT [immutable]".to_string()];
             self.detail_title = "ROOT".to_string();
             return;
@@ -809,6 +814,7 @@ impl TuiApp {
                 };
                 self.selected_file = 0;
                 self.file_scroll = 0;
+                self.select_file(0, false, false);
                 self.refresh_diff();
             }
             Err(error) => self.status = format!("failed to fetch files: {error}"),
@@ -935,24 +941,46 @@ impl TuiApp {
         let Err(error) = guard_command(&self.observation_context(), kind) else {
             return false;
         };
-        self.detail_title = "4 Historical View".to_string();
-        self.detail = self.operation_context_lines();
-        self.detail.push(String::new());
-        self.detail
-            .push(format!("{action} is blocked: {}.", error.reason));
-        self.detail.push(
+        let mut lines = self.operation_context_lines();
+        lines.push(String::new());
+        lines.push(format!("{action} is blocked: {}.", error.reason));
+        lines.push(
             "Normal mutations require the current operation; historical views can only import into current."
                 .to_string(),
         );
-        self.detail.push(
+        lines.push(
             "OP pane Enter only shows operation details; it does not change mutation target."
                 .to_string(),
         );
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        self.show_overlay("Historical View", lines);
         self.status = self
             .historical_warning()
             .unwrap_or_else(|| "historical view: mutation blocked".to_string());
+        true
+    }
+
+    fn show_overlay(&mut self, title: impl Into<String>, lines: Vec<String>) {
+        self.overlay = Some(OverlayPane {
+            title: title.into(),
+            lines,
+            scroll: 0,
+        });
+    }
+
+    fn clear_overlay(&mut self) {
+        self.overlay = None;
+    }
+
+    fn scroll_overlay_page(&mut self, delta: i16) -> bool {
+        let Some(overlay) = &mut self.overlay else {
+            return false;
+        };
+        if delta < 0 {
+            overlay.scroll = overlay.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            overlay.scroll = overlay.scroll.saturating_add(delta as u16);
+        }
+        self.status = "overlay scrolled".to_string();
         true
     }
 
@@ -1191,7 +1219,17 @@ impl TuiApp {
     }
 
     fn file_labels(&self) -> Vec<String> {
-        self.files.iter().map(|file| file.label.clone()).collect()
+        self.files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                if self.selected_files.contains(&index) {
+                    format!("[x] {}", file.label)
+                } else {
+                    format!("[ ] {}", file.label)
+                }
+            })
+            .collect()
     }
 
     fn focus_previous(&mut self) {
@@ -1204,7 +1242,14 @@ impl TuiApp {
         self.set_browse_status(format!("pane: {:?}", self.pane));
     }
 
-    fn focus_at(&mut self, column: u16, row: u16, width: u16, height: u16) {
+    fn focus_at(
+        &mut self,
+        column: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        modifiers: KeyModifiers,
+    ) {
         let body_height = height.saturating_sub(6);
         let old_operation = self.selected_operation;
         let old_change = self.selected_change;
@@ -1213,16 +1258,19 @@ impl TuiApp {
         self.pane = if row >= body_height {
             self.pane
         } else if column < width.saturating_mul(28) / 100 {
-            self.selected_operation = clamp_index(item_row, self.operations.len());
+            self.selected_operation =
+                clamp_index(self.operation_scroll + item_row, self.operations.len());
             UiPane::Operation
         } else if column < width.saturating_mul(56) / 100 {
             if row < body_height.saturating_mul(55) / 100 {
-                self.selected_change = clamp_index(item_row, self.changes.len());
+                self.selected_change =
+                    clamp_index(self.change_scroll + item_row, self.changes.len());
                 UiPane::Change
             } else {
                 let files_top = body_height.saturating_mul(55) / 100;
                 let row_in_files = row.saturating_sub(files_top).saturating_sub(1) as usize;
-                self.selected_file = clamp_index(self.file_scroll + row_in_files, self.files.len());
+                let target = clamp_index(self.file_scroll + row_in_files, self.files.len());
+                self.select_file(target, is_command_modifier(modifiers), false);
                 UiPane::Files
             }
         } else {
@@ -1232,11 +1280,25 @@ impl TuiApp {
         self.set_browse_status(format!("pane: {:?}", self.pane));
     }
 
+    fn scroll_at(&mut self, column: u16, row: u16, width: u16, height: u16, delta: isize) {
+        if self.overlay.is_some() {
+            self.scroll_overlay_page((delta * 3) as i16);
+            return;
+        }
+        self.pane = pane_at(column, row, width, height).unwrap_or(self.pane);
+        match self.pane {
+            UiPane::Diff => self.scroll_detail_page((delta * 3) as i16),
+            _ => self.move_selection(delta),
+        }
+    }
+
     fn sync_after_selection(&mut self, old_operation: usize, old_change: usize, old_file: usize) {
         if self.selected_operation != old_operation {
             self.refresh_changes();
+            self.keep_selected_operation_visible();
         } else if self.selected_change != old_change {
             self.refresh_files();
+            self.keep_selected_change_visible();
         } else if self.selected_file != old_file {
             self.refresh_diff();
         } else {
@@ -1254,12 +1316,15 @@ impl TuiApp {
             UiPane::Operation | UiPane::Repository => {
                 self.selected_operation =
                     move_index(self.selected_operation, self.operations.len(), delta);
+                self.keep_selected_operation_visible();
             }
             UiPane::Change => {
                 self.selected_change = move_index(self.selected_change, self.changes.len(), delta);
+                self.keep_selected_change_visible();
             }
             UiPane::Files => {
                 self.selected_file = move_index(self.selected_file, self.files.len(), delta);
+                self.select_file(self.selected_file, false, false);
                 self.keep_selected_file_visible();
             }
             UiPane::Diff => {
@@ -1273,13 +1338,182 @@ impl TuiApp {
         self.sync_after_selection(old_operation, old_change, old_file);
     }
 
-    fn keep_selected_file_visible(&mut self) {
-        let visible_rows = self.file_visible_rows.max(1);
-        if self.selected_file < self.file_scroll {
-            self.file_scroll = self.selected_file;
-        } else if self.selected_file >= self.file_scroll + visible_rows {
-            self.file_scroll = self.selected_file + 1 - visible_rows;
+    fn jump_selection(&mut self, end: bool) {
+        let old_operation = self.selected_operation;
+        let old_change = self.selected_change;
+        let old_file = self.selected_file;
+        match self.pane {
+            UiPane::Operation | UiPane::Repository => {
+                self.selected_operation = if end {
+                    self.operations.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                self.keep_selected_operation_visible();
+            }
+            UiPane::Change => {
+                self.selected_change = if end {
+                    self.changes.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                self.keep_selected_change_visible();
+            }
+            UiPane::Files => {
+                let target = if end {
+                    self.files.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                self.select_file(target, false, false);
+                self.keep_selected_file_visible();
+            }
+            UiPane::Diff => {}
         }
+        self.sync_after_selection(old_operation, old_change, old_file);
+    }
+
+    fn move_graph_relative(&mut self, to_parent: bool) {
+        let old_operation = self.selected_operation;
+        let old_change = self.selected_change;
+        let old_file = self.selected_file;
+        match self.pane {
+            UiPane::Operation | UiPane::Repository => {
+                if let Some(index) = self.relative_operation_index(to_parent) {
+                    self.selected_operation = index;
+                    self.keep_selected_operation_visible();
+                } else {
+                    self.status = "no operation edge in that direction".to_string();
+                    return;
+                }
+            }
+            UiPane::Change => {
+                if let Some(index) = self.relative_change_index(to_parent) {
+                    self.selected_change = index;
+                    self.keep_selected_change_visible();
+                } else {
+                    self.status = "no change edge in that direction".to_string();
+                    return;
+                }
+            }
+            _ => {
+                self.status =
+                    "h/l graph navigation works in Operation and Change panes".to_string();
+                return;
+            }
+        }
+        self.sync_after_selection(old_operation, old_change, old_file);
+    }
+
+    fn relative_operation_index(&self, to_parent: bool) -> Option<usize> {
+        let selected = self.operations.get(self.selected_operation)?;
+        if to_parent {
+            let parent = selected.parent_ids.first()?;
+            self.operations.iter().position(|op| &op.id == parent)
+        } else {
+            self.operations
+                .iter()
+                .position(|op| op.parent_ids.iter().any(|id| id == &selected.id))
+        }
+    }
+
+    fn relative_change_index(&self, to_parent: bool) -> Option<usize> {
+        let selected = self.changes.get(self.selected_change)?;
+        if to_parent {
+            let parent = selected.parent_commit_ids.first()?;
+            self.changes
+                .iter()
+                .position(|change| &change.commit_id == parent)
+        } else {
+            self.changes.iter().position(|change| {
+                change
+                    .parent_commit_ids
+                    .iter()
+                    .any(|id| id == &selected.commit_id)
+            })
+        }
+    }
+
+    fn toggle_pin_comparison(&mut self) {
+        let Some(current) = self.selected_change() else {
+            self.status = "no change selected to pin".to_string();
+            return;
+        };
+        if let Some(pinned) = self.pinned_change.take() {
+            let lines = vec![
+                "Pinned comparison".to_string(),
+                String::new(),
+                format!("pinned:  {}", pinned.brief()),
+                format!("current: {}", current.brief()),
+            ];
+            self.show_overlay("Pinned Comparison", lines);
+            self.status = "pin comparison shown".to_string();
+        } else {
+            self.pinned_change = Some(current.clone());
+            self.status = format!("pinned {}", current.brief());
+        }
+    }
+
+    fn extend_file_selection(&mut self, delta: isize) {
+        let old_file = self.selected_file;
+        let target = move_index(self.selected_file, self.files.len(), delta);
+        self.select_file(target, false, true);
+        self.keep_selected_file_visible();
+        if self.selected_file != old_file {
+            self.refresh_diff();
+        }
+        self.status = format!("{} file(s) selected", self.selected_files.len());
+    }
+
+    fn select_file(&mut self, index: usize, toggle: bool, extend: bool) {
+        if self.files.is_empty() {
+            self.selected_file = 0;
+            self.selected_files.clear();
+            self.file_selection_anchor = None;
+            return;
+        }
+        let index = clamp_index(index, self.files.len());
+        self.selected_file = index;
+        if toggle {
+            if !self.selected_files.insert(index) {
+                self.selected_files.remove(&index);
+            }
+            self.file_selection_anchor = Some(index);
+        } else if extend {
+            let anchor = self.file_selection_anchor.unwrap_or(index);
+            self.selected_files.clear();
+            for item in anchor.min(index)..=anchor.max(index) {
+                self.selected_files.insert(item);
+            }
+        } else {
+            self.selected_files.clear();
+            self.selected_files.insert(index);
+            self.file_selection_anchor = Some(index);
+        }
+    }
+
+    fn keep_selected_file_visible(&mut self) {
+        keep_selected_visible(
+            self.selected_file,
+            &mut self.file_scroll,
+            self.file_visible_rows,
+        );
+    }
+
+    fn keep_selected_operation_visible(&mut self) {
+        keep_selected_visible(
+            self.selected_operation,
+            &mut self.operation_scroll,
+            self.operation_visible_rows,
+        );
+    }
+
+    fn keep_selected_change_visible(&mut self) {
+        keep_selected_visible(
+            self.selected_change,
+            &mut self.change_scroll,
+            self.change_visible_rows,
+        );
     }
 
     fn scroll_detail_page(&mut self, delta: i16) {
@@ -1312,6 +1546,7 @@ impl TuiApp {
             }
             UiPane::Change => ("4 Change", self.selected_change_detail_lines()),
             UiPane::Files => {
+                self.clear_overlay();
                 self.refresh_diff();
                 self.pane = UiPane::Diff;
                 self.set_browse_status("opened file diff");
@@ -1322,30 +1557,54 @@ impl TuiApp {
                 return;
             }
         };
-        self.detail_title = title.to_string();
-        self.detail = lines;
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        self.show_overlay(title.trim_start_matches("4 "), lines);
         self.set_browse_status(format!("opened {title} detail"));
     }
 
     fn set_preview(&mut self, title: &str, args: &[&str]) {
-        self.detail_title = title.to_string();
-        self.detail = run_self(args).lines().map(str::to_string).collect();
-        if self.detail.is_empty() {
-            self.detail.push("(empty preview)".to_string());
+        let mut lines = run_self(args)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push("(empty preview)".to_string());
         }
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        self.show_overlay(title, lines);
         self.status = format!("rendered {title}");
     }
 
     fn show_help(&mut self) {
-        self.detail_title = "4 Help".to_string();
-        self.detail = render_keys().lines().map(str::to_string).collect();
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        self.show_overlay("Help", render_keys().lines().map(str::to_string).collect());
         self.status = "help".to_string();
+    }
+
+    fn show_command_log(&mut self) {
+        let mut lines = vec!["Recent commands".to_string(), String::new()];
+        if self.command_log.is_empty() {
+            lines.push("(no commands yet)".to_string());
+        } else {
+            lines.extend(self.command_log.iter().rev().map(|entry| {
+                let exit = entry
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                format!("exit {exit} | {} | {}", entry.status, entry.command)
+            }));
+        }
+        self.show_overlay("Command Log", lines);
+        self.status = "command log".to_string();
+    }
+
+    fn push_command_log(&mut self, command: String, exit_code: Option<i32>, status: String) {
+        self.command_log.push(CommandLogEntry {
+            command,
+            exit_code,
+            status,
+        });
+        const MAX_COMMAND_LOG: usize = 30;
+        if self.command_log.len() > MAX_COMMAND_LOG {
+            self.command_log.remove(0);
+        }
     }
 
     fn enter_surgery_mode(&mut self) {
@@ -1368,19 +1627,15 @@ impl TuiApp {
             .current_operation()
             .map(|operation| operation.id.as_str());
         let preview = abandon_preview(vec![target.clone()], current);
-        self.detail_title = "4 Surgery preview abandon".to_string();
-        self.detail = render_preview_panel(&preview_panel_for_abandon(&preview), &preview.warnings)
-            .lines()
-            .map(str::to_string)
-            .collect();
-        self.detail
-            .insert(0, "direct execution blocked".to_string());
-        self.detail
-            .insert(0, "operation graph surgery preview".to_string());
-        self.detail
-            .insert(0, format!("target op: {}", short(&target)));
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        let mut lines =
+            render_preview_panel(&preview_panel_for_abandon(&preview), &preview.warnings)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+        lines.insert(0, "direct execution blocked".to_string());
+        lines.insert(0, "operation graph surgery preview".to_string());
+        lines.insert(0, format!("target op: {}", short(&target)));
+        self.show_overlay("Surgery preview abandon", lines);
         self.status = "surgery preview only; direct execution blocked".to_string();
     }
 
@@ -1497,13 +1752,14 @@ impl TuiApp {
             return;
         }
         self.rebase_source = Some(source.clone());
-        self.detail_title = "4 Rebase source".to_string();
-        self.detail = vec![
-            format!("source: {}", source.brief()),
-            "Move the cursor to the destination change and press Enter.".to_string(),
-            "Esc clears rebase selection.".to_string(),
-        ];
-        self.detail_scroll = 0;
+        self.show_overlay(
+            "Rebase source",
+            vec![
+                format!("source: {}", source.brief()),
+                "Move the cursor to the destination change and press Enter.".to_string(),
+                "Esc clears rebase selection.".to_string(),
+            ],
+        );
         self.pane = UiPane::Change;
         self.status = "select rebase destination".to_string();
     }
@@ -1590,14 +1846,14 @@ impl TuiApp {
             commit_id: change.commit_id.clone(),
             message: String::new(),
         });
-        self.detail_title = format!("4 Describe {}", short(&change.commit_id));
-        self.detail = vec![
-            "Type new description.".to_string(),
-            "Enter: apply, Esc/N: cancel, Backspace: delete".to_string(),
-            String::new(),
-        ];
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        self.show_overlay(
+            format!("Describe {}", short(&change.commit_id)),
+            vec![
+                "Type new description.".to_string(),
+                "Enter: apply, Esc/N: cancel, Backspace: delete".to_string(),
+                String::new(),
+            ],
+        );
         self.status = "describe input".to_string();
     }
 
@@ -1619,16 +1875,20 @@ impl TuiApp {
         let Some(input) = &self.describe_input else {
             return;
         };
-        self.detail = vec![
-            "Type new description.".to_string(),
-            "Enter: apply, Esc/N: cancel, Backspace: delete".to_string(),
-            String::new(),
-            input.message.clone(),
-        ];
+        self.show_overlay(
+            format!("Describe {}", short(&input.commit_id)),
+            vec![
+                "Type new description.".to_string(),
+                "Enter: apply, Esc/N: cancel, Backspace: delete".to_string(),
+                String::new(),
+                input.message.clone(),
+            ],
+        );
     }
 
     fn cancel_describe_input(&mut self) {
         self.describe_input = None;
+        self.clear_overlay();
         self.refresh_diff();
         self.status = "describe cancelled".to_string();
     }
@@ -1656,10 +1916,12 @@ impl TuiApp {
                 if success {
                     self.refresh_after_mutation(Some(&input.change_id));
                 }
-                self.detail_title = "4 Mutation describe".to_string();
-                self.detail = command_result_lines(&result);
-                self.detail_scroll = 0;
-                self.pane = UiPane::Diff;
+                self.push_command_log(
+                    format!("jj {}", args.join(" ")),
+                    Some(result.exit_code),
+                    if success { "ok" } else { "failed" }.to_string(),
+                );
+                self.show_overlay("Mutation describe", command_result_lines(&result));
                 self.status = if success {
                     format!("executed jj {}", args.join(" "))
                 } else {
@@ -1667,9 +1929,15 @@ impl TuiApp {
                 };
             }
             Err(error) => {
-                self.detail_title = "4 Mutation describe".to_string();
-                self.detail = vec![format!("failed to execute jj {}: {error}", args.join(" "))];
-                self.detail_scroll = 0;
+                self.push_command_log(
+                    format!("jj {}", args.join(" ")),
+                    None,
+                    "spawn failed".to_string(),
+                );
+                self.show_overlay(
+                    "Mutation describe",
+                    vec![format!("failed to execute jj {}: {error}", args.join(" "))],
+                );
                 self.status = "describe execution failed".to_string();
             }
         }
@@ -1682,14 +1950,14 @@ impl TuiApp {
         self.commit_input = Some(CommitInput {
             message: String::new(),
         });
-        self.detail_title = "4 Commit".to_string();
-        self.detail = vec![
-            "Type commit description.".to_string(),
-            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
-            String::new(),
-        ];
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        self.show_overlay(
+            "Commit",
+            vec![
+                "Type commit description.".to_string(),
+                "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+                String::new(),
+            ],
+        );
         self.status = "commit input".to_string();
     }
 
@@ -1711,16 +1979,20 @@ impl TuiApp {
         let Some(input) = &self.commit_input else {
             return;
         };
-        self.detail = vec![
-            "Type commit description.".to_string(),
-            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
-            String::new(),
-            input.message.clone(),
-        ];
+        self.show_overlay(
+            "Commit",
+            vec![
+                "Type commit description.".to_string(),
+                "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+                String::new(),
+                input.message.clone(),
+            ],
+        );
     }
 
     fn cancel_commit_input(&mut self) {
         self.commit_input = None;
+        self.clear_overlay();
         self.refresh_diff();
         self.status = "commit cancelled".to_string();
     }
@@ -1756,14 +2028,14 @@ impl TuiApp {
             change,
             name: String::new(),
         });
-        self.detail_title = "4 Bookmark".to_string();
-        self.detail = vec![
-            "Type local bookmark name.".to_string(),
-            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
-            String::new(),
-        ];
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        self.show_overlay(
+            "Bookmark",
+            vec![
+                "Type local bookmark name.".to_string(),
+                "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+                String::new(),
+            ],
+        );
         self.status = "bookmark input".to_string();
     }
 
@@ -1785,16 +2057,20 @@ impl TuiApp {
         let Some(input) = &self.bookmark_input else {
             return;
         };
-        self.detail = vec![
-            "Type local bookmark name.".to_string(),
-            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
-            String::new(),
-            input.name.clone(),
-        ];
+        self.show_overlay(
+            "Bookmark",
+            vec![
+                "Type local bookmark name.".to_string(),
+                "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+                String::new(),
+                input.name.clone(),
+            ],
+        );
     }
 
     fn cancel_bookmark_input(&mut self) {
         self.bookmark_input = None;
+        self.clear_overlay();
         self.refresh_diff();
         self.status = "bookmark cancelled".to_string();
     }
@@ -1832,18 +2108,17 @@ impl TuiApp {
         if self.block_command(mutation.name(), mutation.command_kind()) {
             return;
         }
-        self.detail_title = format!("4 Confirm {}", mutation.name());
-        self.detail = self.operation_context_lines();
-        self.detail.push(String::new());
-        self.detail.extend(mutation.preview_lines());
-        self.detail_scroll = 0;
-        self.pane = UiPane::Diff;
+        let mut lines = self.operation_context_lines();
+        lines.push(String::new());
+        lines.extend(mutation.preview_lines());
+        self.show_overlay(format!("Confirm {}", mutation.name()), lines);
         self.status = "confirm mutation with y".to_string();
         self.pending_mutation = Some(mutation);
     }
 
     fn cancel_pending_mutation(&mut self) {
         self.pending_mutation = None;
+        self.clear_overlay();
         self.refresh_diff();
         self.status = "mutation cancelled".to_string();
     }
@@ -1873,10 +2148,15 @@ impl TuiApp {
                 if success {
                     self.refresh_after_mutation(preferred_change_id.as_deref());
                 }
-                self.detail_title = format!("4 Mutation {}", mutation.name());
-                self.detail = command_result_lines(&result);
-                self.detail_scroll = 0;
-                self.pane = UiPane::Diff;
+                self.push_command_log(
+                    format!("jj {}", args.join(" ")),
+                    Some(result.exit_code),
+                    if success { "ok" } else { "failed" }.to_string(),
+                );
+                self.show_overlay(
+                    format!("Mutation {}", mutation.name()),
+                    command_result_lines(&result),
+                );
                 self.status = if success {
                     format!("executed jj {}", args.join(" "))
                 } else {
@@ -1884,9 +2164,15 @@ impl TuiApp {
                 };
             }
             Err(error) => {
-                self.detail_title = format!("4 Mutation {}", mutation.name());
-                self.detail = vec![format!("failed to execute jj {}: {error}", args.join(" "))];
-                self.detail_scroll = 0;
+                self.push_command_log(
+                    format!("jj {}", args.join(" ")),
+                    None,
+                    "spawn failed".to_string(),
+                );
+                self.show_overlay(
+                    format!("Mutation {}", mutation.name()),
+                    vec![format!("failed to execute jj {}: {error}", args.join(" "))],
+                );
                 self.status = "mutation execution failed".to_string();
             }
         }
@@ -1970,15 +2256,19 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body[1]);
+            app.operation_visible_rows = body[0].height.saturating_sub(2).max(1) as usize;
+            app.change_visible_rows = middle[0].height.saturating_sub(2).max(1) as usize;
             app.file_visible_rows = middle[1].height.saturating_sub(2).max(1) as usize;
+            app.keep_selected_operation_visible();
+            app.keep_selected_change_visible();
             app.keep_selected_file_visible();
 
             frame.render_widget(
                 selectable_list(
                     &operation_title,
-                    &operation_labels,
+                    &visible_from(&operation_labels, app.operation_scroll),
                     app.selected_operation,
-                    0,
+                    app.operation_scroll,
                     app.pane == UiPane::Operation || app.pane == UiPane::Repository,
                     Color::Cyan,
                 ),
@@ -1987,9 +2277,9 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             frame.render_widget(
                 selectable_list(
                     &change_title,
-                    &change_labels,
+                    &visible_from(&change_labels, app.change_scroll),
                     app.selected_change,
-                    0,
+                    app.change_scroll,
                     app.pane == UiPane::Change,
                     Color::Green,
                 ),
@@ -2025,15 +2315,41 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 Paragraph::new(bottom_key_hint()).block(Block::default().borders(Borders::ALL)),
                 areas[2],
             );
+            if let Some(overlay) = &app.overlay {
+                let area = centered_rect(70, 70, frame.size());
+                frame.render_widget(Clear, area);
+                frame.render_widget(
+                    Paragraph::new(styled_lines(&overlay.lines))
+                        .block(focused_block(overlay.title.as_str(), true, Color::Yellow))
+                        .scroll((overlay.scroll, 0))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            }
         })?;
 
         let event = event::read()?;
         let Event::Key(key) = event else {
-            if let Event::Mouse(mouse) = event
-                && matches!(mouse.kind, MouseEventKind::Down(_))
-            {
+            if let Event::Mouse(mouse) = event {
                 let size = terminal.size()?;
-                app.focus_at(mouse.column, mouse.row, size.width, size.height);
+                match mouse.kind {
+                    MouseEventKind::Down(_) => {
+                        app.focus_at(
+                            mouse.column,
+                            mouse.row,
+                            size.width,
+                            size.height,
+                            mouse.modifiers,
+                        );
+                    }
+                    MouseEventKind::ScrollUp => {
+                        app.scroll_at(mouse.column, mouse.row, size.width, size.height, -3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.scroll_at(mouse.column, mouse.row, size.width, size.height, 3);
+                    }
+                    _ => {}
+                }
             }
             continue;
         };
@@ -2081,6 +2397,11 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             continue;
         }
         let action = match key.code {
+            KeyCode::Esc if app.overlay.is_some() => {
+                app.clear_overlay();
+                app.set_browse_status("overlay closed");
+                continue;
+            }
             KeyCode::Esc if app.mode == UiMode::Surgery => {
                 app.exit_surgery_mode();
                 continue;
@@ -2117,13 +2438,27 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             }
             KeyCode::Char('O') => {
                 app.status = match app.selected_editor_file() {
-                    Ok(file) => launcher
-                        .open_editor(OpenRequest {
-                            file,
-                            placement: launcher.settings.placement,
-                        })
-                        .map(|_| "editor launched".to_string())
-                        .unwrap_or_else(|error| error),
+                    Ok(file) => match launcher.open_editor(OpenRequest {
+                        file: file.clone(),
+                        placement: launcher.settings.placement,
+                    }) {
+                        Ok(()) => {
+                            app.push_command_log(
+                                format!("open editor {file}"),
+                                Some(0),
+                                "ok".to_string(),
+                            );
+                            "editor launched".to_string()
+                        }
+                        Err(error) => {
+                            app.push_command_log(
+                                format!("open editor {file}"),
+                                None,
+                                "failed".to_string(),
+                            );
+                            error
+                        }
+                    },
                     Err(error) => error,
                 };
                 continue;
@@ -2188,8 +2523,46 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.show_help();
                 continue;
             }
+            KeyCode::Char('L') => {
+                app.show_command_log();
+                continue;
+            }
+            KeyCode::Char(' ') => {
+                app.toggle_pin_comparison();
+                continue;
+            }
+            KeyCode::Char('h') => {
+                app.move_graph_relative(true);
+                continue;
+            }
+            KeyCode::Char('l') => {
+                app.move_graph_relative(false);
+                continue;
+            }
+            KeyCode::Up if is_command_modifier(key.modifiers) => {
+                app.jump_selection(false);
+                continue;
+            }
+            KeyCode::Down if is_command_modifier(key.modifiers) => {
+                app.jump_selection(true);
+                continue;
+            }
+            KeyCode::Up
+                if key.modifiers.contains(KeyModifiers::SHIFT) && app.pane == UiPane::Files =>
+            {
+                app.extend_file_selection(-1);
+                continue;
+            }
+            KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::SHIFT) && app.pane == UiPane::Files =>
+            {
+                app.extend_file_selection(1);
+                continue;
+            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                app.scroll_detail_page(-12);
+                if !app.scroll_overlay_page(-12) {
+                    app.scroll_detail_page(-12);
+                }
                 continue;
             }
             KeyCode::Enter if app.rebase_source.is_some() => {
@@ -2242,36 +2615,11 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
     }
 }
 
-fn selectable_list<'a>(
-    title: &'a str,
-    items: &'a [String],
-    selected: usize,
-    offset: usize,
-    focused: bool,
-    color: Color,
-) -> List<'a> {
-    let rows = items
-        .iter()
-        .enumerate()
-        .map(|(row, item)| {
-            let index = offset + row;
-            let style = if index == selected {
-                selected_row_style(focused)
-            } else {
-                Style::default().fg(color)
-            };
-            ListItem::new(Line::from(Span::styled(item.as_str(), style)))
-        })
-        .collect::<Vec<_>>();
-
-    List::new(rows).block(focused_block(title, focused, color))
-}
-
 fn bottom_key_hint<'a>() -> Line<'a> {
     Line::from(vec![
         Span::styled("Keys ", Style::default().fg(Color::Green)),
         Span::raw(
-            "?:hint Tab/Shft Tab:Pane Move j/k:Scroll O:OpenFile n:new a:abandon s:Squash S:Surgery U:Undo c:commit p:push B:Rebase I:import ",
+            "?:hint Tab/Shft Tab:Pane j/k:Move h/l:Graph Space:Pin L:Log O:Open n:new a:abandon s:Squash S:Surgery U:Undo c:commit p:push B:Rebase I:import ",
         ),
     ])
 }
@@ -2284,135 +2632,6 @@ fn status_line(app: &TuiApp) -> Line<'_> {
         Style::default().fg(app.status_color()),
     ));
     Line::from(spans)
-}
-
-fn visible_from(items: &[String], offset: usize) -> Vec<String> {
-    items.iter().skip(offset).cloned().collect()
-}
-
-impl TerminalLauncher for ConfiguredLauncher {
-    fn open_editor(&self, request: OpenRequest) -> Result<(), String> {
-        match request.placement {
-            OpenPlacement::CurrentTerminal => Err(
-                "current-terminal editor disabled in TUI; use new-window/new-pane/new-tab"
-                    .to_string(),
-            ),
-            OpenPlacement::NewWindow => spawn_new_window(&self.settings, &request.file),
-            OpenPlacement::NewPane | OpenPlacement::NewTab => {
-                if std::env::var_os("TMUX").is_some() {
-                    spawn_tmux(&self.settings.command, &request.file, request.placement)
-                } else {
-                    spawn_new_window(&self.settings, &request.file)
-                }
-            }
-        }
-    }
-}
-
-fn load_editor_settings() -> EditorSettings {
-    let mut settings = EditorSettings {
-        command: vec!["fresh".to_string(), "{file}".to_string()],
-        placement: OpenPlacement::NewWindow,
-        launcher: "ghostty".to_string(),
-    };
-    for path in config_paths() {
-        if let Ok(text) = fs::read_to_string(path) {
-            parse_editor_settings(&text, &mut settings);
-        }
-    }
-    settings
-}
-
-fn config_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(PathBuf::from(home).join(".config/vijutsu/config.toml"));
-    }
-    paths.push(PathBuf::from("vijutsu.toml"));
-    paths
-}
-
-fn parse_editor_settings(text: &str, settings: &mut EditorSettings) {
-    let mut section = "";
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "[editor]" || line == "[terminal]" {
-            section = line;
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match (section, key.trim()) {
-            ("[editor]", "command") => {
-                let command = parse_string_array(value);
-                if !command.is_empty() {
-                    settings.command = command;
-                }
-            }
-            ("[terminal]", "placement") => {
-                settings.placement = parse_placement(value).unwrap_or(settings.placement);
-            }
-            ("[terminal]", "launcher") => {
-                if let Some(value) = parse_string(value) {
-                    settings.launcher = value;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn parse_string_array(value: &str) -> Vec<String> {
-    value
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .filter_map(parse_string)
-        .collect()
-}
-
-fn parse_string(value: &str) -> Option<String> {
-    let value = value.trim();
-    let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
-    Some(quoted.to_string())
-}
-
-fn parse_placement(value: &str) -> Option<OpenPlacement> {
-    match parse_string(value)?.as_str() {
-        "current-terminal" => Some(OpenPlacement::CurrentTerminal),
-        "new-pane" => Some(OpenPlacement::NewPane),
-        "new-tab" => Some(OpenPlacement::NewTab),
-        "new-window" => Some(OpenPlacement::NewWindow),
-        _ => None,
-    }
-}
-
-fn editor_argv(command: &[String], file: &str) -> Result<Vec<String>, String> {
-    if command.is_empty() {
-        return Err("editor command is empty".to_string());
-    }
-    Ok(command
-        .iter()
-        .map(|part| part.replace("{file}", file))
-        .collect())
-}
-
-fn run_editor_command(command: &[String], file: &str) -> Result<(), String> {
-    let argv = editor_argv(command, file)?;
-    let status = Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .map_err(|error| format!("failed to run editor {}: {error}", argv[0]))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("editor exited with {status}"))
-    }
 }
 
 fn command_result_lines(result: &vijutsu::cli::CommandResult) -> Vec<String> {
@@ -2429,42 +2648,6 @@ fn command_result_lines(result: &vijutsu::cli::CommandResult) -> Vec<String> {
         lines.extend(result.stderr.trim().lines().map(str::to_string));
     }
     lines
-}
-
-fn spawn_new_window(settings: &EditorSettings, file: &str) -> Result<(), String> {
-    let argv = editor_argv(&settings.command, file)?;
-    let mut command = if settings.launcher == "ghostty" && cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.args(["-na", "Ghostty.app", "--args", "-e"]);
-        command
-    } else {
-        let mut command = Command::new(&settings.launcher);
-        command.arg("-e");
-        command
-    };
-    command.args(&argv);
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("failed to launch {}: {error}", settings.launcher))
-}
-
-fn spawn_tmux(command: &[String], file: &str, placement: OpenPlacement) -> Result<(), String> {
-    let argv = editor_argv(command, file)?;
-    let joined = argv.join(" ");
-    let mut tmux = Command::new("tmux");
-    match placement {
-        OpenPlacement::NewPane => {
-            tmux.args(["split-window", &joined]);
-        }
-        OpenPlacement::NewTab => {
-            tmux.args(["new-window", &joined]);
-        }
-        _ => return run_editor_command(command, file),
-    }
-    tmux.spawn()
-        .map(|_| ())
-        .map_err(|error| format!("failed to launch tmux: {error}"))
 }
 
 fn load_operations() -> Result<(String, String, Vec<TuiOperation>), String> {
@@ -2559,8 +2742,19 @@ fn annotate_operation_states(version: &str, operations: &mut [TuiOperation]) {
         .zip(state_suffixes(&op_ids, &fingerprints))
     {
         if !suffix.is_empty() {
-            operation.label.push_str(&suffix);
+            operation.label = label_with_state_suffix(&operation.label, &suffix);
         }
+    }
+}
+
+fn label_with_state_suffix(label: &str, suffix: &str) -> String {
+    let suffix = suffix.trim();
+    if suffix.is_empty() {
+        return label.to_string();
+    }
+    match label.split_once(' ') {
+        Some((op_id, rest)) => format!("{op_id} {suffix} {rest}"),
+        None => format!("{label} {suffix}"),
     }
 }
 
@@ -2627,55 +2821,6 @@ fn fail_tui_parse<T>(context: &str, result: &ParseResult<T>) -> Result<(), Strin
     parse_diagnostic(context, &result.errors, &result.raw_stdout)
         .map(Err)
         .unwrap_or(Ok(()))
-}
-
-fn focused_block<'a>(title: &'a str, focused: bool, color: Color) -> Block<'a> {
-    let style = if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(color)
-    };
-    Block::default()
-        .title(Span::styled(title, style.add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_type(if focused {
-            BorderType::Thick
-        } else {
-            BorderType::Plain
-        })
-        .border_style(style)
-}
-
-fn selected_row_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::UNDERLINED)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Black).bg(Color::Gray)
-    }
-}
-
-fn styled_lines(lines: &[String]) -> Vec<Line<'_>> {
-    lines
-        .iter()
-        .map(|line| {
-            let color = if line.starts_with('+') {
-                Color::Green
-            } else if line.starts_with('-') {
-                Color::Red
-            } else if line.starts_with("@@") {
-                Color::Cyan
-            } else if line.starts_with("warning:") {
-                Color::Yellow
-            } else {
-                Color::White
-            };
-            Line::from(Span::styled(line.as_str(), Style::default().fg(color)))
-        })
-        .collect()
 }
 
 fn non_empty_or(lines: Vec<String>, fallback: &str) -> Vec<String> {
@@ -2749,6 +2894,56 @@ fn move_index(index: usize, len: usize, delta: isize) -> usize {
     index
         .saturating_add_signed(delta)
         .min(len.saturating_sub(1))
+}
+
+fn keep_selected_visible(selected: usize, scroll: &mut usize, visible_rows: usize) {
+    let visible_rows = visible_rows.max(1);
+    if selected < *scroll {
+        *scroll = selected;
+    } else if selected >= *scroll + visible_rows {
+        *scroll = selected + 1 - visible_rows;
+    }
+}
+
+fn is_command_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::META)
+}
+
+fn pane_at(column: u16, row: u16, width: u16, height: u16) -> Option<UiPane> {
+    let body_height = height.saturating_sub(6);
+    if row >= body_height {
+        return None;
+    }
+    if column < width.saturating_mul(28) / 100 {
+        Some(UiPane::Operation)
+    } else if column < width.saturating_mul(56) / 100 {
+        if row < body_height.saturating_mul(55) / 100 {
+            Some(UiPane::Change)
+        } else {
+            Some(UiPane::Files)
+        }
+    } else {
+        Some(UiPane::Diff)
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn is_root_commit(commit_id: &str) -> bool {
@@ -3406,6 +3601,14 @@ mod tests {
     }
 
     #[test]
+    fn operation_state_suffix_is_inserted_after_operation_id() {
+        assert_eq!(
+            label_with_state_suffix("abc12345 undo def67890 [state ≈ xyz]", " S1 (= oldop)"),
+            "abc12345 S1 (= oldop) undo def67890 [state ≈ xyz]"
+        );
+    }
+
+    #[test]
     fn poll_options_accepts_fast_single_sample() {
         let options = PollOptions::parse(&args(&["--interval-ms", "0", "--count", "1"])).unwrap();
 
@@ -3416,31 +3619,6 @@ mod tests {
     #[test]
     fn poll_options_rejects_zero_count() {
         assert!(PollOptions::parse(&args(&["--count", "0"])).is_err());
-    }
-
-    #[test]
-    fn editor_settings_parse_command_and_terminal() {
-        let mut settings = EditorSettings {
-            command: vec!["fresh".to_string(), "{file}".to_string()],
-            placement: OpenPlacement::NewWindow,
-            launcher: "ghostty".to_string(),
-        };
-
-        parse_editor_settings(
-            r#"
-[editor]
-command = ["nvim", "{file}"]
-
-[terminal]
-placement = "new-pane"
-launcher = "tmux"
-"#,
-            &mut settings,
-        );
-
-        assert_eq!(settings.command, vec!["nvim", "{file}"]);
-        assert_eq!(settings.placement, OpenPlacement::NewPane);
-        assert_eq!(settings.launcher, "tmux");
     }
 
     #[test]
