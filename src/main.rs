@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
 
 use vijutsu::cli::{
     ParseError, ParseResult, detect_capabilities, execute_snapshot_refresh, fetch_bookmark_list,
@@ -327,6 +327,11 @@ enum PendingMutation {
     Restore {
         change: SelectedChange,
     },
+    ImportHistoricalFile {
+        source_op: String,
+        source: SelectedChange,
+        path: String,
+    },
     Commit {
         message: String,
     },
@@ -397,6 +402,9 @@ impl PendingMutation {
             PendingMutation::Abandon { .. } => "abandon selected change",
             PendingMutation::Rebase { .. } => "rebase selected change",
             PendingMutation::Restore { .. } => "restore selected change",
+            PendingMutation::ImportHistoricalFile { .. } => {
+                "import historical file into current working copy"
+            }
             PendingMutation::Commit { .. } => "commit current change",
             PendingMutation::BookmarkSet { .. } => "set bookmark on selected change",
             PendingMutation::Push { .. } => "push to git remote",
@@ -437,6 +445,15 @@ impl PendingMutation {
                     change.commit_id.clone(),
                 ]
             }
+            PendingMutation::ImportHistoricalFile { source, path, .. } => vec![
+                "restore".to_string(),
+                "--from".to_string(),
+                source.commit_id.clone(),
+                "--into".to_string(),
+                "@".to_string(),
+                "--".to_string(),
+                path.clone(),
+            ],
             PendingMutation::Commit { message } => {
                 vec!["commit".to_string(), "-m".to_string(), message.clone()]
             }
@@ -466,10 +483,27 @@ impl PendingMutation {
             | PendingMutation::Rebase { source: change, .. }
             | PendingMutation::Restore { change }
             | PendingMutation::BookmarkSet { change, .. } => Some(&change.change_id),
+            PendingMutation::ImportHistoricalFile { .. } => None,
             PendingMutation::Undo
             | PendingMutation::Abandon { .. }
             | PendingMutation::Commit { .. }
             | PendingMutation::Push { .. } => None,
+        }
+    }
+
+    fn command_kind(&self) -> CommandKind {
+        match self {
+            PendingMutation::ImportHistoricalFile { .. } => CommandKind::ImportFromHistorical,
+            PendingMutation::Undo
+            | PendingMutation::Edit { .. }
+            | PendingMutation::NewChild { .. }
+            | PendingMutation::SquashCurrent { .. }
+            | PendingMutation::Abandon { .. }
+            | PendingMutation::Rebase { .. }
+            | PendingMutation::Restore { .. }
+            | PendingMutation::Commit { .. }
+            | PendingMutation::BookmarkSet { .. }
+            | PendingMutation::Push { .. } => CommandKind::MutateCurrent,
         }
     }
 
@@ -557,6 +591,21 @@ impl PendingMutation {
                 "This undoes the selected change's diff in the working copy.".to_string(),
                 "It is equivalent to jj restore --changes-in <selected>.".to_string(),
                 "Use U to undo this operation if it was not intended.".to_string(),
+            ],
+            PendingMutation::ImportHistoricalFile {
+                source_op,
+                source,
+                path,
+            } => vec![
+                "Import historical file into current working copy".to_string(),
+                String::new(),
+                format!("source op: {}", short(source_op)),
+                format!("source commit: {}", short(&source.commit_id)),
+                format!("source path: {path}"),
+                "write target: current operation head (@)".to_string(),
+                String::new(),
+                "The historical operation remains read-only.".to_string(),
+                "This writes only to the current working copy.".to_string(),
             ],
             PendingMutation::Commit { message } => vec![
                 "Commit current working-copy change".to_string(),
@@ -870,17 +919,20 @@ impl TuiApp {
     }
 
     fn block_historical_mutation(&mut self, action: &str) -> bool {
-        if guard_command(&self.observation_context(), CommandKind::MutateCurrent).is_ok() {
+        self.block_command(action, CommandKind::MutateCurrent)
+    }
+
+    fn block_command(&mut self, action: &str, kind: CommandKind) -> bool {
+        let Err(error) = guard_command(&self.observation_context(), kind) else {
             return false;
-        }
+        };
         self.detail_title = "4 Historical View".to_string();
         self.detail = self.operation_context_lines();
         self.detail.push(String::new());
-        self.detail.push(format!(
-            "{action} is blocked while viewing a historical operation."
-        ));
+        self.detail
+            .push(format!("{action} is blocked: {}.", error.reason));
         self.detail.push(
-            "Select the current operation (@) before mutating; r only refreshes the view."
+            "Normal mutations require the current operation; historical views can only import into current."
                 .to_string(),
         );
         self.detail.push(
@@ -1409,6 +1461,34 @@ impl TuiApp {
         self.set_pending_mutation(PendingMutation::Restore { change });
     }
 
+    fn plan_import_historical_file(&mut self) {
+        if self.block_command("import historical file", CommandKind::ImportFromHistorical) {
+            return;
+        }
+        let Some(source_op) = self.selected_operation_id() else {
+            self.status = "no historical operation selected".to_string();
+            return;
+        };
+        let Some(source) = self.selected_change() else {
+            self.status = "no source change selected".to_string();
+            return;
+        };
+        if is_root_commit(&source.commit_id) {
+            self.status = "cannot import from ROOT".to_string();
+            return;
+        }
+        let path = self.selected_file_path().to_string();
+        if path.is_empty() {
+            self.status = "no file selected for import".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::ImportHistoricalFile {
+            source_op,
+            source,
+            path,
+        });
+    }
+
     fn begin_describe_selected(&mut self) {
         if self.block_historical_mutation("describe") {
             return;
@@ -1665,7 +1745,7 @@ impl TuiApp {
     }
 
     fn set_pending_mutation(&mut self, mutation: PendingMutation) {
-        if self.block_historical_mutation(mutation.name()) {
+        if self.block_command(mutation.name(), mutation.command_kind()) {
             return;
         }
         self.detail_title = format!("4 Confirm {}", mutation.name());
@@ -1685,7 +1765,15 @@ impl TuiApp {
     }
 
     fn execute_pending_mutation(&mut self) {
-        if self.block_historical_mutation("execute mutation") {
+        let Some(kind) = self
+            .pending_mutation
+            .as_ref()
+            .map(PendingMutation::command_kind)
+        else {
+            self.status = "no pending mutation".to_string();
+            return;
+        };
+        if self.block_command("execute mutation", kind) {
             return;
         }
         let Some(mutation) = self.pending_mutation.take() else {
@@ -2008,6 +2096,10 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.plan_restore_selected();
                 continue;
             }
+            KeyCode::Char('I') => {
+                app.plan_import_historical_file();
+                continue;
+            }
             KeyCode::Char('?') => {
                 app.show_help();
                 continue;
@@ -2080,10 +2172,7 @@ fn selectable_list<'a>(
         .map(|(row, item)| {
             let index = offset + row;
             let style = if index == selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                selected_row_style(focused, color)
             } else {
                 Style::default().fg(color)
             };
@@ -2096,8 +2185,10 @@ fn selectable_list<'a>(
 
 fn bottom_key_hint<'a>() -> Line<'a> {
     Line::from(vec![
-        Span::styled("Keys ", Style::default().fg(Color::Cyan)),
-        Span::raw("Tab j/k O n a s U c B p ?"),
+        Span::styled("Keys ", Style::default().fg(Color::Green)),
+        Span::raw(
+            "?:hint Tab/Shft Tab:Pane Move j/k:Scroll O:OpenFile n:new a:abandon s:Squash U:Undo c:commit p:push B:Rebase I:import ",
+        ),
     ])
 }
 
@@ -2426,7 +2517,24 @@ fn focused_block<'a>(title: &'a str, focused: bool, color: Color) -> Block<'a> {
     Block::default()
         .title(Span::styled(title, style.add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
         .border_style(style)
+}
+
+fn selected_row_style(focused: bool, color: Color) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::UNDERLINED)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::Gray)
+    }
 }
 
 fn styled_lines(lines: &[String]) -> Vec<Line<'_>> {
@@ -3277,6 +3385,32 @@ launcher = "tmux"
                 "feature".to_string(),
                 "-r".to_string(),
                 "commit-id".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn historical_file_import_restores_source_commit_path_into_current() {
+        let mutation = PendingMutation::ImportHistoricalFile {
+            source_op: "op-old".to_string(),
+            source: SelectedChange {
+                change_id: "change-id".to_string(),
+                commit_id: "commit-id".to_string(),
+            },
+            path: "rireki.txt".to_string(),
+        };
+
+        assert_eq!(mutation.command_kind(), CommandKind::ImportFromHistorical);
+        assert_eq!(
+            mutation.command_args(),
+            vec![
+                "restore".to_string(),
+                "--from".to_string(),
+                "commit-id".to_string(),
+                "--into".to_string(),
+                "@".to_string(),
+                "--".to_string(),
+                "rireki.txt".to_string(),
             ]
         );
     }

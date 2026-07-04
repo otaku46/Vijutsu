@@ -359,6 +359,7 @@ pub fn render_keys() -> String {
         "a: abandon selected change",
         "b: rebase selected change",
         "z: restore selected change",
+        "I: import selected historical file into current working copy",
         "U: undo last operation",
         "?: show this help",
         "q: quit",

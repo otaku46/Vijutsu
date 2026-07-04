@@ -16,7 +16,8 @@ pub enum Freshness {
 pub enum CommandKind {
     Inspect,
     MutateCurrent,
-    MutateCurrentUsingHistoricalTarget,
+    ImportFromHistorical,
+    SurgeryOperationGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,14 @@ pub fn guard_command(
         return Err(CommandBlocked {
             reason: "view is not fresh; refresh before mutating",
         });
+    }
+    if command == CommandKind::ImportFromHistorical {
+        return match context.view_mode {
+            ViewMode::Historical(_) => Ok(()),
+            ViewMode::FollowCurrent => Err(CommandBlocked {
+                reason: "import requires a historical source view",
+            }),
+        };
     }
     if context.observed_operation != context.current_operation {
         return Err(CommandBlocked {
@@ -83,6 +92,15 @@ mod tests {
         }
     }
 
+    fn historical_context(freshness: Freshness) -> ObservationContext {
+        ObservationContext {
+            view_mode: ViewMode::Historical("op-old".to_string()),
+            observed_operation: "op-old".to_string(),
+            current_operation: "op-current".to_string(),
+            freshness,
+        }
+    }
+
     #[test]
     fn historical_mutate_current_is_rejected() {
         let context = context(
@@ -103,6 +121,28 @@ mod tests {
         let context = context(ViewMode::FollowCurrent, Freshness::Current);
 
         assert_eq!(guard_command(&context, CommandKind::MutateCurrent), Ok(()));
+    }
+
+    #[test]
+    fn historical_import_is_allowed_when_fresh() {
+        let context = historical_context(Freshness::Current);
+
+        assert_eq!(
+            guard_command(&context, CommandKind::ImportFromHistorical),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn current_import_without_historical_source_is_rejected() {
+        let context = context(ViewMode::FollowCurrent, Freshness::Current);
+
+        assert_eq!(
+            guard_command(&context, CommandKind::ImportFromHistorical),
+            Err(CommandBlocked {
+                reason: "import requires a historical source view",
+            })
+        );
     }
 
     #[test]

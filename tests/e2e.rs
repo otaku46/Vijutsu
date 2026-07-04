@@ -241,6 +241,7 @@ fn keys_lists_supported_bindings() {
         "Tab: switch pane",
         "Ctrl-r: redo preview",
         "B: set or move local bookmark",
+        "I: import selected historical file",
         "q: quit",
     ] {
         assert!(out.contains(expected), "missing {expected} in\n{out}");
