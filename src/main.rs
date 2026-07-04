@@ -267,6 +267,7 @@ struct TuiApp {
     detail_title: String,
     detail: Vec<String>,
     overlay: Option<OverlayPane>,
+    maximized_pane: Option<UiPane>,
     selected_operation: usize,
     selected_change: usize,
     selected_file: usize,
@@ -296,6 +297,11 @@ struct OverlayPane {
     title: String,
     lines: Vec<String>,
     scroll: u16,
+}
+
+struct InputCursor {
+    line: u16,
+    column: u16,
 }
 
 struct CommandLogEntry {
@@ -694,6 +700,7 @@ impl TuiApp {
                 "u: undo preview  Ctrl-r: redo preview  R: snapshot preview".to_string(),
             ],
             overlay: None,
+            maximized_pane: None,
             selected_operation: 0,
             selected_change: 0,
             selected_file: 0,
@@ -1574,7 +1581,7 @@ impl TuiApp {
     }
 
     fn show_help(&mut self) {
-        self.show_overlay("Help", render_keys().lines().map(str::to_string).collect());
+        self.show_overlay("Help", pane_mode_help());
         self.status = "help".to_string();
     }
 
@@ -1605,6 +1612,39 @@ impl TuiApp {
         if self.command_log.len() > MAX_COMMAND_LOG {
             self.command_log.remove(0);
         }
+    }
+
+    fn input_cursor(&self) -> Option<InputCursor> {
+        if let Some(input) = &self.describe_input {
+            return Some(InputCursor {
+                line: 3,
+                column: input.message.chars().count() as u16,
+            });
+        }
+        if let Some(input) = &self.commit_input {
+            return Some(InputCursor {
+                line: 3,
+                column: input.message.chars().count() as u16,
+            });
+        }
+        if let Some(input) = &self.bookmark_input {
+            return Some(InputCursor {
+                line: 3,
+                column: input.name.chars().count() as u16,
+            });
+        }
+        None
+    }
+
+    fn toggle_maximize_pane(&mut self) {
+        self.maximized_pane = match self.maximized_pane {
+            Some(pane) if pane == self.pane => None,
+            _ => Some(self.pane),
+        };
+        self.set_browse_status(match self.maximized_pane {
+            Some(_) => "pane maximized",
+            None => "pane restored",
+        });
     }
 
     fn enter_surgery_mode(&mut self) {
@@ -2263,60 +2303,81 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             app.keep_selected_change_visible();
             app.keep_selected_file_visible();
 
-            frame.render_widget(
-                selectable_list(
-                    &operation_title,
-                    &visible_from(&operation_labels, app.operation_scroll),
-                    app.selected_operation,
-                    app.operation_scroll,
-                    app.pane == UiPane::Operation || app.pane == UiPane::Repository,
-                    Color::Cyan,
-                ),
-                body[0],
-            );
-            frame.render_widget(
-                selectable_list(
-                    &change_title,
-                    &visible_from(&change_labels, app.change_scroll),
-                    app.selected_change,
-                    app.change_scroll,
-                    app.pane == UiPane::Change,
-                    Color::Green,
-                ),
-                middle[0],
-            );
-            frame.render_widget(
-                selectable_list(
-                    &files_title,
-                    &visible_from(&file_labels, app.file_scroll),
-                    app.selected_file,
-                    app.file_scroll,
-                    app.pane == UiPane::Files,
-                    Color::Magenta,
-                ),
-                middle[1],
-            );
-            frame.render_widget(
-                Paragraph::new(styled_lines(&app.detail))
-                    .block(focused_block(
-                        app.detail_title.as_str(),
-                        app.pane == UiPane::Diff,
-                        Color::Yellow,
-                    ))
-                    .scroll((app.detail_scroll, 0))
-                    .wrap(Wrap { trim: false }),
-                body[2],
-            );
+            let render_operation = |frame: &mut ratatui::Frame<'_>, area| {
+                frame.render_widget(
+                    selectable_list(
+                        &operation_title,
+                        &visible_from(&operation_labels, app.operation_scroll),
+                        app.selected_operation,
+                        app.operation_scroll,
+                        app.pane == UiPane::Operation || app.pane == UiPane::Repository,
+                        Color::Cyan,
+                    ),
+                    area,
+                );
+            };
+            let render_change = |frame: &mut ratatui::Frame<'_>, area| {
+                frame.render_widget(
+                    selectable_list(
+                        &change_title,
+                        &visible_from(&change_labels, app.change_scroll),
+                        app.selected_change,
+                        app.change_scroll,
+                        app.pane == UiPane::Change,
+                        Color::Green,
+                    ),
+                    area,
+                );
+            };
+            let render_files = |frame: &mut ratatui::Frame<'_>, area| {
+                frame.render_widget(
+                    selectable_list(
+                        &files_title,
+                        &visible_from(&file_labels, app.file_scroll),
+                        app.selected_file,
+                        app.file_scroll,
+                        app.pane == UiPane::Files,
+                        Color::Magenta,
+                    ),
+                    area,
+                );
+            };
+            let render_diff = |frame: &mut ratatui::Frame<'_>, area| {
+                frame.render_widget(
+                    Paragraph::new(styled_lines(&app.detail))
+                        .block(focused_block(
+                            app.detail_title.as_str(),
+                            app.pane == UiPane::Diff,
+                            Color::Yellow,
+                        ))
+                        .scroll((app.detail_scroll, 0))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            };
+
+            match app.maximized_pane {
+                Some(UiPane::Operation | UiPane::Repository) => render_operation(frame, areas[0]),
+                Some(UiPane::Change) => render_change(frame, areas[0]),
+                Some(UiPane::Files) => render_files(frame, areas[0]),
+                Some(UiPane::Diff) => render_diff(frame, areas[0]),
+                None => {
+                    render_operation(frame, body[0]);
+                    render_change(frame, middle[0]);
+                    render_files(frame, middle[1]);
+                    render_diff(frame, body[2]);
+                }
+            }
             frame.render_widget(
                 Paragraph::new(status_line(&app)).block(Block::default().borders(Borders::ALL)),
                 areas[1],
             );
             frame.render_widget(
-                Paragraph::new(bottom_key_hint()).block(Block::default().borders(Borders::ALL)),
+                Paragraph::new(bottom_key_hint(&app)).block(Block::default().borders(Borders::ALL)),
                 areas[2],
             );
             if let Some(overlay) = &app.overlay {
-                let area = centered_rect(70, 70, frame.size());
+                let area = centered_rect(60, 55, frame.size());
                 frame.render_widget(Clear, area);
                 frame.render_widget(
                     Paragraph::new(styled_lines(&overlay.lines))
@@ -2325,6 +2386,12 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                         .wrap(Wrap { trim: false }),
                     area,
                 );
+                if let Some(cursor) = app.input_cursor() {
+                    frame.set_cursor(
+                        area.x.saturating_add(1).saturating_add(cursor.column),
+                        area.y.saturating_add(1).saturating_add(cursor.line),
+                    );
+                }
             }
         })?;
 
@@ -2511,8 +2578,12 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.begin_rebase_selected();
                 continue;
             }
-            KeyCode::Char('z') => {
+            KeyCode::Char('Z') => {
                 app.plan_restore_selected();
+                continue;
+            }
+            KeyCode::Char('z') => {
+                app.toggle_maximize_pane();
                 continue;
             }
             KeyCode::Char('I') => {
@@ -2615,13 +2686,46 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
     }
 }
 
-fn bottom_key_hint<'a>() -> Line<'a> {
+fn bottom_key_hint(app: &TuiApp) -> Line<'static> {
     Line::from(vec![
         Span::styled("Keys ", Style::default().fg(Color::Green)),
-        Span::raw(
-            "?:hint Tab/Shft Tab:Pane j/k:Move h/l:Graph Space:Pin L:Log O:Open n:new a:abandon s:Squash S:Surgery U:Undo c:commit p:push B:Rebase I:import ",
-        ),
+        Span::raw(context_key_hint(app)),
     ])
+}
+
+fn context_key_hint(app: &TuiApp) -> &'static str {
+    if app.overlay.is_some() {
+        return "Esc:close Enter/Shift+Enter:scroll ";
+    }
+    match (app.mode, app.pane) {
+        (UiMode::Surgery, UiPane::Operation | UiPane::Repository) => {
+            "Tab:Pane j/k:Move h/l:Graph a:preview abandon Esc:Browse z:max ? "
+        }
+        (_, UiPane::Operation | UiPane::Repository) => {
+            "Tab:Pane j/k:Move h/l:Graph Enter:detail S:Surgery z:max ? "
+        }
+        (_, UiPane::Change) => {
+            "Tab:Pane j/k:Move h/l:Graph Space:Pin e:edit n:new d:describe a:abandon s:squash b:rebase Z:restore z:max ? "
+        }
+        (_, UiPane::Files) => {
+            "Tab:Pane j/k:Move Shift+↑↓:range Cmd+click:toggle Enter:diff O:open I:import z:max ? "
+        }
+        (_, UiPane::Diff) => "Tab:Pane j/k:Scroll Enter:page Shift+Enter:page up z:max L:log ? ",
+    }
+}
+
+fn pane_mode_help() -> Vec<String> {
+    vec![
+        "Pane x Mode".to_string(),
+        String::new(),
+        "Pane        Inspect / Current                         Majutsu / Historical                  Shujutsu / Surgery".to_string(),
+        "Operation   h/l graph, Enter detail, S surgery         read-only detail, import via Files    a preview op abandon, Esc browse".to_string(),
+        "Change      e n d a s b Z, Space pin                   read-only; mutation blocked           no change mutation".to_string(),
+        "Files       Enter diff, O open, range select           I import historical file              no file mutation".to_string(),
+        "Diff        j/k scroll, Enter page, Shift+Enter up     same                                same".to_string(),
+        String::new(),
+        "Global      Tab/S-Tab pane, 1-4 focus, z maximize, L command log, ? help, q quit".to_string(),
+    ]
 }
 
 fn status_line(app: &TuiApp) -> Line<'_> {
