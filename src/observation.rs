@@ -350,6 +350,7 @@ fn id_matches(full: &str, query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::parse_jsonl;
     use crate::core::{ChangeFlags, ChangeNode};
 
     use super::*;
@@ -532,5 +533,54 @@ mod tests {
         });
 
         assert_eq!(parsed.root_ids, vec!["k0"]);
+    }
+
+    #[test]
+    fn golden_change_log_converts_to_domain_graph() {
+        let graph = change_graph_from_parse(parse_jsonl(
+            include_str!("../tests/fixtures/jj/change_log.jsonl"),
+            "change",
+        ));
+
+        assert_eq!(
+            graph.root_ids,
+            vec!["0000000000000000000000000000000000000000"]
+        );
+        let base = graph
+            .nodes
+            .iter()
+            .find(|node| node.commit_id == "commit-a")
+            .unwrap();
+        assert_eq!(base.bookmarks[0].name, "main");
+        assert_eq!(base.bookmarks[0].remote, None);
+        assert_eq!(base.bookmarks[1].name, "main");
+        assert_eq!(base.bookmarks[1].remote.as_deref(), Some("origin"));
+
+        let working = graph
+            .nodes
+            .iter()
+            .find(|node| node.commit_id == "commit-b")
+            .unwrap();
+        assert_eq!(working.workspace_names, vec!["default"]);
+        assert!(working.flags.has_conflict);
+        assert!(working.flags.is_divergent);
+    }
+
+    #[test]
+    fn golden_operation_log_converts_to_domain_graph() {
+        let graph = operation_graph_from_parse(parse_jsonl(
+            include_str!("../tests/fixtures/jj/op_log.jsonl"),
+            "operation",
+        ));
+
+        assert_eq!(graph.head_ids, vec!["op-new"]);
+        let current = graph
+            .nodes
+            .iter()
+            .find(|node| node.operation_id == "op-new")
+            .unwrap();
+        assert!(current.is_head);
+        assert!(current.is_selected);
+        assert_eq!(current.parent_operation_ids, vec!["op-mid"]);
     }
 }
