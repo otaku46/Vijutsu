@@ -257,6 +257,7 @@ fn print_keys() {
 }
 
 struct TuiApp {
+    mode: UiMode,
     pane: UiPane,
     operations: Vec<TuiOperation>,
     changes: Vec<TuiChange>,
@@ -278,6 +279,12 @@ struct TuiApp {
     commit_input: Option<CommitInput>,
     bookmark_input: Option<BookmarkInput>,
     rebase_source: Option<SelectedChange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiMode {
+    Browse,
+    Surgery,
 }
 
 struct TuiOperation {
@@ -680,6 +687,7 @@ impl TuiChange {
 impl TuiApp {
     fn new() -> Self {
         let mut app = Self {
+            mode: UiMode::Browse,
             pane: UiPane::Operation,
             operations: Vec::new(),
             changes: Vec::new(),
@@ -1006,17 +1014,56 @@ impl TuiApp {
             .unwrap_or("")
     }
 
-    fn context(&self) -> String {
+    fn context_spans(&self) -> Vec<Span<'_>> {
         let op = self
             .selected_operation_id()
             .map(|id| short(&id).to_string())
             .unwrap_or_else(|| "?".to_string());
-        format!(
-            "op {op} | current head {} | {} | snapshot only | fs unchanged | gen {}",
-            short(&self.current_head),
-            self.view_mode(),
-            self.observed_at
-        )
+        let (label, fg, bg) = self.mode_badge();
+        vec![
+            Span::styled(
+                format!(" {label} "),
+                Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "op {op} | current head {} | {} | snapshot only | fs unchanged | gen {}",
+                    short(&self.current_head),
+                    self.view_mode(),
+                    self.observed_at
+                ),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]
+    }
+
+    fn mode_badge(&self) -> (&'static str, Color, Color) {
+        if self.pending_mutation.as_ref().is_some_and(|mutation| {
+            matches!(mutation, PendingMutation::ImportHistoricalFile { .. })
+        }) {
+            ("IMPORT", Color::Black, Color::Yellow)
+        } else if self.mode == UiMode::Surgery {
+            ("SURGERY", Color::White, Color::Red)
+        } else if self.is_viewing_current_operation() {
+            ("CURRENT", Color::Black, Color::Green)
+        } else {
+            ("TIME TRAVEL", Color::Black, Color::Magenta)
+        }
+    }
+
+    fn status_color(&self) -> Color {
+        if self.pending_mutation.as_ref().is_some_and(|mutation| {
+            matches!(mutation, PendingMutation::ImportHistoricalFile { .. })
+        }) {
+            Color::Yellow
+        } else if self.mode == UiMode::Surgery {
+            Color::Red
+        } else if self.is_viewing_current_operation() {
+            Color::Green
+        } else {
+            Color::Red
+        }
     }
 
     fn operation_title(&self) -> String {
@@ -1298,6 +1345,42 @@ impl TuiApp {
         self.detail_scroll = 0;
         self.pane = UiPane::Diff;
         self.status = "help".to_string();
+    }
+
+    fn enter_surgery_mode(&mut self) {
+        self.mode = UiMode::Surgery;
+        self.pane = UiPane::Operation;
+        self.status = "operation graph surgery; Operation pane actions only".to_string();
+    }
+
+    fn exit_surgery_mode(&mut self) {
+        self.mode = UiMode::Browse;
+        self.set_browse_status("left surgery mode");
+    }
+
+    fn preview_surgery_abandon_selected_operation(&mut self) {
+        let Some(target) = self.selected_operation_id() else {
+            self.status = "no operation selected".to_string();
+            return;
+        };
+        let current = self
+            .current_operation()
+            .map(|operation| operation.id.as_str());
+        let preview = abandon_preview(vec![target.clone()], current);
+        self.detail_title = "4 Surgery preview abandon".to_string();
+        self.detail = render_preview_panel(&preview_panel_for_abandon(&preview), &preview.warnings)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        self.detail
+            .insert(0, "direct execution blocked".to_string());
+        self.detail
+            .insert(0, "operation graph surgery preview".to_string());
+        self.detail
+            .insert(0, format!("target op: {}", short(&target)));
+        self.detail_scroll = 0;
+        self.pane = UiPane::Diff;
+        self.status = "surgery preview only; direct execution blocked".to_string();
     }
 
     fn plan_undo(&mut self) {
@@ -1934,19 +2017,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 body[2],
             );
             frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(app.context(), Style::default().fg(Color::Cyan)),
-                    Span::raw(" | "),
-                    Span::styled(
-                        app.status.as_str(),
-                        Style::default().fg(if app.is_viewing_current_operation() {
-                            Color::Green
-                        } else {
-                            Color::Red
-                        }),
-                    ),
-                ]))
-                .block(Block::default().borders(Borders::ALL)),
+                Paragraph::new(status_line(&app)).block(Block::default().borders(Borders::ALL)),
                 areas[1],
             );
             frame.render_widget(
@@ -2009,6 +2080,10 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             continue;
         }
         let action = match key.code {
+            KeyCode::Esc if app.mode == UiMode::Surgery => {
+                app.exit_surgery_mode();
+                continue;
+            }
             KeyCode::Esc if app.rebase_source.is_some() => {
                 app.rebase_source = None;
                 app.refresh_diff();
@@ -2080,12 +2155,20 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.plan_push();
                 continue;
             }
+            KeyCode::Char('S') => {
+                app.enter_surgery_mode();
+                continue;
+            }
             KeyCode::Char('s') => {
                 app.plan_squash_current();
                 continue;
             }
             KeyCode::Char('a') => {
-                app.plan_abandon_selected();
+                if app.mode == UiMode::Surgery {
+                    app.preview_surgery_abandon_selected_operation();
+                } else {
+                    app.plan_abandon_selected();
+                }
                 continue;
             }
             KeyCode::Char('b') => {
@@ -2172,7 +2255,7 @@ fn selectable_list<'a>(
         .map(|(row, item)| {
             let index = offset + row;
             let style = if index == selected {
-                selected_row_style(focused, color)
+                selected_row_style(focused)
             } else {
                 Style::default().fg(color)
             };
@@ -2187,9 +2270,19 @@ fn bottom_key_hint<'a>() -> Line<'a> {
     Line::from(vec![
         Span::styled("Keys ", Style::default().fg(Color::Green)),
         Span::raw(
-            "?:hint Tab/Shft Tab:Pane Move j/k:Scroll O:OpenFile n:new a:abandon s:Squash U:Undo c:commit p:push B:Rebase I:import ",
+            "?:hint Tab/Shft Tab:Pane Move j/k:Scroll O:OpenFile n:new a:abandon s:Squash S:Surgery U:Undo c:commit p:push B:Rebase I:import ",
         ),
     ])
+}
+
+fn status_line(app: &TuiApp) -> Line<'_> {
+    let mut spans = app.context_spans();
+    spans.push(Span::raw(" | "));
+    spans.push(Span::styled(
+        app.status.as_str(),
+        Style::default().fg(app.status_color()),
+    ));
+    Line::from(spans)
 }
 
 fn visible_from(items: &[String], offset: usize) -> Vec<String> {
@@ -2525,7 +2618,7 @@ fn focused_block<'a>(title: &'a str, focused: bool, color: Color) -> Block<'a> {
         .border_style(style)
 }
 
-fn selected_row_style(focused: bool, color: Color) -> Style {
+fn selected_row_style(focused: bool) -> Style {
     if focused {
         Style::default()
             .fg(Color::Black)

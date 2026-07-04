@@ -356,6 +356,7 @@ pub fn render_keys() -> String {
         "n: new child from selected change",
         "d: describe selected change",
         "s: squash current into parent",
+        "S: enter operation graph surgery mode",
         "a: abandon selected change",
         "b: rebase selected change",
         "z: restore selected change",

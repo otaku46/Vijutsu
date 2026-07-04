@@ -53,6 +53,9 @@ pub fn guard_command(
             }),
         };
     }
+    if command == CommandKind::SurgeryOperationGraph {
+        return Ok(());
+    }
     if context.observed_operation != context.current_operation {
         return Err(CommandBlocked {
             reason: "observed operation no longer matches current operation",
@@ -142,6 +145,16 @@ mod tests {
             Err(CommandBlocked {
                 reason: "import requires a historical source view",
             })
+        );
+    }
+
+    #[test]
+    fn operation_graph_surgery_is_allowed_from_historical_view_when_fresh() {
+        let context = historical_context(Freshness::Current);
+
+        assert_eq!(
+            guard_command(&context, CommandKind::SurgeryOperationGraph),
+            Ok(())
         );
     }
 
