@@ -865,6 +865,24 @@ impl TuiApp {
         }
     }
 
+    fn snapshot_then_refresh(&mut self) {
+        match execute_snapshot_refresh() {
+            Ok(result) => {
+                self.push_command_log(
+                    "jj util snapshot".to_string(),
+                    Some(result.exit_code),
+                    "snapshot ok".to_string(),
+                );
+                self.refresh_all();
+                self.set_browse_status("snapshot refreshed");
+            }
+            Err(error) => {
+                self.push_command_log("jj util snapshot".to_string(), None, "failed".to_string());
+                self.status = format!("snapshot failed: {error}");
+            }
+        }
+    }
+
     fn refresh_after_mutation(&mut self, preferred_change_id: Option<&str>) {
         self.refresh_all();
         if let Some(index) = self
@@ -2830,7 +2848,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.set_preview("Preview redo", &["preview", "redo"]);
             }
             UiCommand::PreviewSnapshot => {
-                app.set_preview("Preview snapshot", &["snapshot"]);
+                app.snapshot_then_refresh();
             }
             UiCommand::Quit => return Ok(()),
             UiCommand::MoveSelection { delta } => app.move_selection(delta),
@@ -2855,15 +2873,17 @@ fn context_key_hint(app: &TuiApp) -> &'static str {
             "Tab:Pane j/k:Move h/l:Graph a:preview abandon Esc:Browse z:max ? "
         }
         (_, UiPane::Operation | UiPane::Repository) => {
-            "Tab:Pane j/k:Move h/l:Graph Enter:detail S:Surgery z:max ? "
+            "Tab:Pane j/k:Move h/l:Graph Enter:detail r:refresh R:snapshot S:Surgery z:max ? "
         }
         (_, UiPane::Change) => {
-            "Tab:Pane j/k:Move h/l:Graph Space:Pin e:edit n:new d:describe a:abandon s:squash b:rebase Z:restore z:max ? "
+            "Tab:Pane j/k:Move h/l:Graph Space:Pin r:refresh R:snapshot e:edit n:new d:describe a:abandon s:squash b:rebase Z:restore z:max ? "
         }
         (_, UiPane::Files) => {
-            "Tab:Pane j/k:Move Shift+↑↓:range Cmd+click:toggle Enter:diff O:open I:import z:max ? "
+            "Tab:Pane j/k:Move Shift+↑↓:range Cmd+click:toggle Enter:diff O:open I:import r:refresh R:snapshot z:max ? "
         }
-        (_, UiPane::Diff) => "Tab:Pane j/k:Scroll Enter:page Shift+Enter:page up z:max L:log ? ",
+        (_, UiPane::Diff) => {
+            "Tab:Pane j/k:Scroll Enter:page Shift+Enter:page up r:refresh R:snapshot z:max L:log ? "
+        }
     }
 }
 

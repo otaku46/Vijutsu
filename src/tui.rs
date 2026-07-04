@@ -348,7 +348,7 @@ pub fn render_keys() -> String {
         "Space: pin or compare selected change",
         "Tab: switch pane",
         "r: read-only refresh",
-        "R: snapshot preview",
+        "R: snapshot and refresh",
         "u: undo preview",
         "Ctrl-r: redo preview",
         "O: open selected file externally",
