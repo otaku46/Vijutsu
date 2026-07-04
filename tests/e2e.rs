@@ -240,6 +240,7 @@ fn keys_lists_supported_bindings() {
         "k: previous",
         "Tab: switch pane",
         "Ctrl-r: redo preview",
+        "B: set or move local bookmark",
         "q: quit",
     ] {
         assert!(out.contains(expected), "missing {expected} in\n{out}");
@@ -254,6 +255,33 @@ fn help_lists_tui_command() {
 
     assert_success("help", &output);
     assert!(stdout(&output).contains("  tui"));
+}
+
+#[test]
+fn bookmarks_command_lists_local_bookmark() {
+    let repo = TempRepo::new();
+    let _ = repo.add_rireki_change("rireki:a", "a\n");
+    let set = repo.jj(&["bookmark", "set", "feature", "-r", "@"]);
+    assert_success("jj bookmark set feature", &set);
+
+    let output = repo.run(&["bookmarks"]);
+
+    assert_success("bookmarks", &output);
+    assert!(stdout(&output).contains("feature"));
+}
+
+#[test]
+fn inspect_shows_bookmark_on_change() {
+    let repo = TempRepo::new();
+    let commit = repo.add_rireki_change("rireki:a", "a\n");
+    let set = repo.jj(&["bookmark", "set", "feature", "-r", &commit]);
+    assert_success("jj bookmark set feature", &set);
+
+    let output = repo.run(&["inspect", "--change", &commit]);
+
+    assert_success("inspect bookmark", &output);
+    let out = stdout(&output);
+    assert!(out.contains("bookmark:feature"), "{out}");
 }
 
 #[test]

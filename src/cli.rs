@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::core::{ChangeFlags, ChangeNode, JjCapabilities, OperationNode};
+use crate::core::{Bookmark, ChangeFlags, ChangeNode, JjCapabilities, OperationNode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandEnvelope {
@@ -102,11 +102,7 @@ impl From<ChangeRecord> for ChangeNode {
             bookmarks: record
                 .bookmarks
                 .into_iter()
-                .map(|name| crate::core::Bookmark {
-                    name,
-                    remote: None,
-                    is_conflicted: false,
-                })
+                .map(bookmark_from_template_name)
                 .collect(),
             workspace_names: record.working_copies,
             flags: ChangeFlags {
@@ -117,6 +113,21 @@ impl From<ChangeRecord> for ChangeNode {
                 is_divergent: record.is_divergent,
             },
         }
+    }
+}
+
+fn bookmark_from_template_name(raw: String) -> Bookmark {
+    let Some((name, remote)) = raw.rsplit_once('@') else {
+        return Bookmark {
+            name: raw,
+            remote: None,
+            is_conflicted: false,
+        };
+    };
+    Bookmark {
+        name: name.to_string(),
+        remote: Some(remote.to_string()),
+        is_conflicted: false,
     }
 }
 
@@ -406,6 +417,10 @@ pub fn fetch_diff_for_path(at_op: &str, revision: &str, path: &str) -> std::io::
     Ok(result.stdout)
 }
 
+pub fn fetch_bookmark_list() -> std::io::Result<CommandResult> {
+    execute(&isolated_jj(["--ignore-working-copy", "bookmark", "list"]))
+}
+
 pub fn execute_snapshot_refresh() -> std::io::Result<CommandResult> {
     let result = execute(&isolated_jj(["util", "snapshot"]))?;
     ensure_success(&result)?;
@@ -542,6 +557,26 @@ mod tests {
                     path: "README.md".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn bookmark_template_name_splits_remote_suffix() {
+        assert_eq!(
+            bookmark_from_template_name("feature".to_string()),
+            Bookmark {
+                name: "feature".to_string(),
+                remote: None,
+                is_conflicted: false,
+            }
+        );
+        assert_eq!(
+            bookmark_from_template_name("main@origin".to_string()),
+            Bookmark {
+                name: "main".to_string(),
+                remote: Some("origin".to_string()),
+                is_conflicted: false,
+            }
         );
     }
 }

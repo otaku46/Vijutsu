@@ -20,8 +20,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use vijutsu::cli::{
-    ParseError, ParseResult, detect_capabilities, execute_snapshot_refresh, fetch_change_records,
-    fetch_diff, fetch_diff_for_path, fetch_file_summary, fetch_operation_records, jj_version,
+    ParseError, ParseResult, detect_capabilities, execute_snapshot_refresh, fetch_bookmark_list,
+    fetch_change_records, fetch_diff, fetch_diff_for_path, fetch_file_summary,
+    fetch_operation_records, jj_version,
 };
 use vijutsu::core::{JjCapabilities, ObservationFreshness};
 use vijutsu::graph::{GraphCharset, GraphNode, render_graph_rows};
@@ -55,6 +56,7 @@ fn main() {
         Some("mutate") => mutate(args.collect()),
         Some("snapshot") => snapshot(args.collect()),
         Some("heads") => print_heads(),
+        Some("bookmarks") => print_bookmarks(),
         Some("keys") => print_keys(),
         Some("tui") => run_tui_or_exit(),
         Some("poll") => poll(args.collect()),
@@ -225,6 +227,7 @@ fn print_help() {
     println!("  mutate redo --execute");
     println!("  snapshot [--execute]");
     println!("  heads");
+    println!("  bookmarks");
     println!("  keys");
     println!("  tui");
     println!("  poll [--interval-ms <N>] [--count <N>]");
@@ -236,6 +239,17 @@ fn print_heads() {
     let version = jj_version_string();
     let graph = fetch_operation_graph(&version, "@", 100, "operation heads");
     print!("{}", render_multiple_heads(&detect_multiple_heads(&graph)));
+}
+
+fn print_bookmarks() {
+    match fetch_bookmark_list() {
+        Ok(result) if result.exit_code == 0 => print!("{}", result.stdout),
+        Ok(result) => {
+            eprintln!("{}", result.stderr.trim());
+            std::process::exit(result.exit_code);
+        }
+        Err(error) => fail_io("fetch bookmarks", error),
+    }
 }
 
 fn print_keys() {
@@ -262,6 +276,7 @@ struct TuiApp {
     pending_mutation: Option<PendingMutation>,
     describe_input: Option<DescribeInput>,
     commit_input: Option<CommitInput>,
+    bookmark_input: Option<BookmarkInput>,
     rebase_source: Option<SelectedChange>,
 }
 
@@ -315,7 +330,13 @@ enum PendingMutation {
     Commit {
         message: String,
     },
-    Push,
+    BookmarkSet {
+        name: String,
+        change: SelectedChange,
+    },
+    Push {
+        bookmark: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +353,11 @@ struct DescribeInput {
 
 struct CommitInput {
     message: String,
+}
+
+struct BookmarkInput {
+    change: SelectedChange,
+    name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,7 +398,8 @@ impl PendingMutation {
             PendingMutation::Rebase { .. } => "rebase selected change",
             PendingMutation::Restore { .. } => "restore selected change",
             PendingMutation::Commit { .. } => "commit current change",
-            PendingMutation::Push => "push to git remote",
+            PendingMutation::BookmarkSet { .. } => "set bookmark on selected change",
+            PendingMutation::Push { .. } => "push to git remote",
         }
     }
 
@@ -413,7 +440,21 @@ impl PendingMutation {
             PendingMutation::Commit { message } => {
                 vec!["commit".to_string(), "-m".to_string(), message.clone()]
             }
-            PendingMutation::Push => vec!["git".to_string(), "push".to_string()],
+            PendingMutation::BookmarkSet { name, change } => vec![
+                "bookmark".to_string(),
+                "set".to_string(),
+                name.clone(),
+                "-r".to_string(),
+                change.commit_id.clone(),
+            ],
+            PendingMutation::Push { bookmark } => {
+                let mut args = vec!["git".to_string(), "push".to_string()];
+                if let Some(bookmark) = bookmark {
+                    args.push("--bookmark".to_string());
+                    args.push(bookmark.clone());
+                }
+                args
+            }
         }
     }
 
@@ -423,11 +464,12 @@ impl PendingMutation {
             | PendingMutation::NewChild { change }
             | PendingMutation::SquashCurrent { source: change, .. }
             | PendingMutation::Rebase { source: change, .. }
-            | PendingMutation::Restore { change } => Some(&change.change_id),
+            | PendingMutation::Restore { change }
+            | PendingMutation::BookmarkSet { change, .. } => Some(&change.change_id),
             PendingMutation::Undo
             | PendingMutation::Abandon { .. }
             | PendingMutation::Commit { .. }
-            | PendingMutation::Push => None,
+            | PendingMutation::Push { .. } => None,
         }
     }
 
@@ -526,14 +568,30 @@ impl PendingMutation {
                 "Message:".to_string(),
                 format!("  {message}"),
             ],
-            PendingMutation::Push => vec![
-                "Push to Git remote".to_string(),
+            PendingMutation::BookmarkSet { name, change } => vec![
+                "Set bookmark".to_string(),
                 String::new(),
-                "This runs jj git push with the repository's default remote/bookmark behavior."
-                    .to_string(),
-                "It may update remote bookmarks after Jujutsu safety checks.".to_string(),
-                "If this is not intended, press N or Esc.".to_string(),
+                format!("Bookmark: {name}"),
+                format!("Target: {}", change.brief()),
+                String::new(),
+                "This creates or moves the local bookmark to the selected change.".to_string(),
+                "Push later publishes the bookmark position to a Git remote.".to_string(),
             ],
+            PendingMutation::Push { bookmark } => {
+                let mut lines = vec![
+                    "Push to Git remote".to_string(),
+                    String::new(),
+                    "This runs jj git push with the repository's default remote/bookmark behavior."
+                        .to_string(),
+                    "It may update remote bookmarks after Jujutsu safety checks.".to_string(),
+                    "If this is not intended, press N or Esc.".to_string(),
+                ];
+                if let Some(bookmark) = bookmark {
+                    lines.insert(2, format!("Bookmark: {bookmark}"));
+                    lines.insert(3, String::new());
+                }
+                lines
+            }
         };
         lines.push(String::new());
         lines.push(format!("Command: jj {}", args.join(" ")));
@@ -560,6 +618,13 @@ impl From<&TuiChange> for SelectedChange {
 impl TuiChange {
     fn brief(&self) -> String {
         format!("{} {}", short(&self.change_id), short(&self.commit_id))
+    }
+
+    fn local_bookmark(&self) -> Option<String> {
+        self.bookmarks
+            .iter()
+            .find(|bookmark| !bookmark.contains('@'))
+            .cloned()
     }
 }
 
@@ -588,6 +653,7 @@ impl TuiApp {
             pending_mutation: None,
             describe_input: None,
             commit_input: None,
+            bookmark_input: None,
             rebase_source: None,
         };
         app.refresh_all();
@@ -989,6 +1055,41 @@ impl TuiApp {
         )
     }
 
+    fn selected_change_detail_lines(&self) -> Vec<String> {
+        let Some(change) = self.changes.get(self.selected_change) else {
+            return vec!["(nothing selected)".to_string()];
+        };
+        let mut lines = vec![
+            selected_line(&self.change_labels(), self.selected_change),
+            format!("change: {}", change.change_id),
+            format!("commit: {}", change.commit_id),
+        ];
+        if !change.parent_commit_ids.is_empty() {
+            lines.push(format!(
+                "parents: {}",
+                change
+                    .parent_commit_ids
+                    .iter()
+                    .map(|id| short(id).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        lines.push(String::new());
+        lines.push("Bookmarks:".to_string());
+        if change.bookmarks.is_empty() {
+            lines.push("  (none)".to_string());
+        } else {
+            lines.extend(
+                change
+                    .bookmarks
+                    .iter()
+                    .map(|bookmark| format!("  {}", bookmark_display(bookmark))),
+            );
+        }
+        lines
+    }
+
     fn file_labels(&self) -> Vec<String> {
         self.files.iter().map(|file| file.label.clone()).collect()
     }
@@ -1109,10 +1210,7 @@ impl TuiApp {
                 }
                 ("4 Operation", lines)
             }
-            UiPane::Change => (
-                "4 Change",
-                vec![selected_line(&self.change_labels(), self.selected_change)],
-            ),
+            UiPane::Change => ("4 Change", self.selected_change_detail_lines()),
             UiPane::Files => {
                 self.refresh_diff();
                 self.pane = UiPane::Diff;
@@ -1478,11 +1576,92 @@ impl TuiApp {
         self.set_pending_mutation(PendingMutation::Commit { message });
     }
 
+    fn begin_bookmark_input(&mut self) {
+        if self.block_historical_mutation("bookmark") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&change.commit_id) {
+            self.status = "cannot bookmark ROOT".to_string();
+            return;
+        }
+        self.bookmark_input = Some(BookmarkInput {
+            change,
+            name: String::new(),
+        });
+        self.detail_title = "4 Bookmark".to_string();
+        self.detail = vec![
+            "Type local bookmark name.".to_string(),
+            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+            String::new(),
+        ];
+        self.detail_scroll = 0;
+        self.pane = UiPane::Diff;
+        self.status = "bookmark input".to_string();
+    }
+
+    fn push_bookmark_char(&mut self, ch: char) {
+        if let Some(input) = &mut self.bookmark_input {
+            input.name.push(ch);
+            self.render_bookmark_input();
+        }
+    }
+
+    fn pop_bookmark_char(&mut self) {
+        if let Some(input) = &mut self.bookmark_input {
+            input.name.pop();
+            self.render_bookmark_input();
+        }
+    }
+
+    fn render_bookmark_input(&mut self) {
+        let Some(input) = &self.bookmark_input else {
+            return;
+        };
+        self.detail = vec![
+            "Type local bookmark name.".to_string(),
+            "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
+            String::new(),
+            input.name.clone(),
+        ];
+    }
+
+    fn cancel_bookmark_input(&mut self) {
+        self.bookmark_input = None;
+        self.refresh_diff();
+        self.status = "bookmark cancelled".to_string();
+    }
+
+    fn confirm_bookmark_input(&mut self) {
+        if self.block_historical_mutation("bookmark") {
+            return;
+        }
+        let Some(input) = self.bookmark_input.take() else {
+            return;
+        };
+        let name = input.name.trim().to_string();
+        if name.is_empty() {
+            self.status = "bookmark name is empty; cancelled".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::BookmarkSet {
+            name,
+            change: input.change,
+        });
+    }
+
     fn plan_push(&mut self) {
         if self.block_historical_mutation("push") {
             return;
         }
-        self.set_pending_mutation(PendingMutation::Push);
+        let bookmark = self
+            .changes
+            .get(self.selected_change)
+            .and_then(TuiChange::local_bookmark);
+        self.set_pending_mutation(PendingMutation::Push { bookmark });
     }
 
     fn set_pending_mutation(&mut self, mutation: PendingMutation) {
@@ -1721,6 +1900,16 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             }
             continue;
         }
+        if app.bookmark_input.is_some() {
+            match key.code {
+                KeyCode::Enter => app.confirm_bookmark_input(),
+                KeyCode::Esc | KeyCode::Char('N') => app.cancel_bookmark_input(),
+                KeyCode::Backspace => app.pop_bookmark_char(),
+                KeyCode::Char(ch) => app.push_bookmark_char(ch),
+                _ => app.status = "bookmark input: type, Enter confirm, Esc/N cancel".to_string(),
+            }
+            continue;
+        }
         if app.pending_mutation.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => app.execute_pending_mutation(),
@@ -1793,6 +1982,10 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             }
             KeyCode::Char('c') => {
                 app.begin_commit_input();
+                continue;
+            }
+            KeyCode::Char('B') => {
+                app.begin_bookmark_input();
                 continue;
             }
             KeyCode::Char('p') => {
@@ -1904,7 +2097,7 @@ fn selectable_list<'a>(
 fn bottom_key_hint<'a>() -> Line<'a> {
     Line::from(vec![
         Span::styled("Keys ", Style::default().fg(Color::Cyan)),
-        Span::raw("Tab j/k O n a s U c p ?"),
+        Span::raw("Tab j/k O n a s U c B p ?"),
     ])
 }
 
@@ -2191,16 +2384,18 @@ fn load_changes(version: &str, op_id: &str) -> Result<Vec<TuiChange>, String> {
                 if record.is_immutable {
                     flags.push("immutable");
                 }
+                let bookmarks = bookmark_label_suffix(&record.bookmarks);
                 let suffix = if flags.is_empty() {
                     String::new()
                 } else {
                     format!(" [{}]", flags.join(" "))
                 };
                 format!(
-                    "{} {} {}{}",
+                    "{} {} {}{}{}",
                     short(&record.change_id),
                     short(&record.commit_id),
                     record.description,
+                    bookmarks,
                     suffix
                 )
             };
@@ -2267,6 +2462,29 @@ fn selected_line(lines: &[String], index: usize) -> String {
         .get(index)
         .cloned()
         .unwrap_or_else(|| "(nothing selected)".to_string())
+}
+
+fn bookmark_label_suffix(bookmarks: &[String]) -> String {
+    if bookmarks.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " [{}]",
+            bookmarks
+                .iter()
+                .map(|bookmark| bookmark_display(bookmark))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+}
+
+fn bookmark_display(bookmark: &str) -> String {
+    if bookmark.contains('@') {
+        format!("{bookmark}:remote")
+    } else {
+        format!("{bookmark}:local")
+    }
 }
 
 fn operation_semantic_suffix(description: &str) -> Option<String> {
@@ -3014,6 +3232,53 @@ launcher = "tmux"
             Some(" [target: 12345678]")
         );
         assert!(operation_semantic_suffix("abandon commit abcdef").is_none());
+    }
+
+    #[test]
+    fn bookmark_label_suffix_marks_local_and_remote() {
+        assert_eq!(
+            bookmark_label_suffix(&["feature".to_string(), "main@origin".to_string()]),
+            " [feature:local main@origin:remote]"
+        );
+    }
+
+    #[test]
+    fn push_selected_bookmark_uses_bookmark_arg() {
+        let mutation = PendingMutation::Push {
+            bookmark: Some("feature".to_string()),
+        };
+
+        assert_eq!(
+            mutation.command_args(),
+            vec![
+                "git".to_string(),
+                "push".to_string(),
+                "--bookmark".to_string(),
+                "feature".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bookmark_set_uses_selected_change_revision() {
+        let mutation = PendingMutation::BookmarkSet {
+            name: "feature".to_string(),
+            change: SelectedChange {
+                change_id: "change-id".to_string(),
+                commit_id: "commit-id".to_string(),
+            },
+        };
+
+        assert_eq!(
+            mutation.command_args(),
+            vec![
+                "bookmark".to_string(),
+                "set".to_string(),
+                "feature".to_string(),
+                "-r".to_string(),
+                "commit-id".to_string(),
+            ]
+        );
     }
 
     fn test_capabilities() -> JjCapabilities {
