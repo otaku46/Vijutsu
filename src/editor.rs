@@ -72,20 +72,37 @@ fn config_paths() -> Vec<PathBuf> {
 }
 
 fn parse_editor_settings(text: &str, settings: &mut EditorSettings) {
-    let mut section = "";
+    let mut section = String::new();
+    let mut pending = String::new();
     for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
+        let stripped = strip_comment(raw).trim().to_string();
+        if stripped.is_empty() {
+            continue;
+        }
+        if !pending.is_empty() {
+            pending.push(' ');
+            pending.push_str(&stripped);
+        } else {
+            pending = stripped;
+        }
+        if bracket_delta(&pending) > 0 {
+            continue;
+        }
+        let line = pending.trim();
         if line.is_empty() {
+            pending.clear();
             continue;
         }
         if line == "[editor]" || line == "[terminal]" {
-            section = line;
+            section = line.to_string();
+            pending.clear();
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
+            pending.clear();
             continue;
         };
-        match (section, key.trim()) {
+        match (section.as_str(), key.trim()) {
             ("[editor]", "command") => {
                 let command = parse_string_array(value);
                 if !command.is_empty() {
@@ -102,16 +119,14 @@ fn parse_editor_settings(text: &str, settings: &mut EditorSettings) {
             }
             _ => {}
         }
+        pending.clear();
     }
 }
 
 fn parse_string_array(value: &str) -> Vec<String> {
-    value
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .filter_map(parse_string)
+    split_array_items(value)
+        .into_iter()
+        .filter_map(|item| parse_string(&item))
         .collect()
 }
 
@@ -119,6 +134,78 @@ fn parse_string(value: &str) -> Option<String> {
     let value = value.trim();
     let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
     Some(quoted.to_string())
+}
+
+fn strip_comment(raw: &str) -> &str {
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (index, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            '#' if !in_quote => return &raw[..index],
+            _ => {}
+        }
+    }
+    raw
+}
+
+fn bracket_delta(value: &str) -> isize {
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut delta = 0;
+    for ch in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            '[' if !in_quote => delta += 1,
+            ']' if !in_quote => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+fn split_array_items(value: &str) -> Vec<String> {
+    let value = value.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quote => {
+                current.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                current.push(ch);
+                in_quote = !in_quote;
+            }
+            ',' if !in_quote => {
+                items.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+    items
 }
 
 fn parse_placement(value: &str) -> Option<OpenPlacement> {
@@ -217,5 +304,32 @@ launcher = "tmux"
         assert_eq!(settings.command, vec!["nvim", "{file}"]);
         assert_eq!(settings.placement, OpenPlacement::NewPane);
         assert_eq!(settings.launcher, "tmux");
+    }
+
+    #[test]
+    fn editor_settings_parse_multiline_and_quoted_punctuation() {
+        let mut settings = EditorSettings {
+            command: vec!["fresh".to_string(), "{file}".to_string()],
+            placement: OpenPlacement::NewWindow,
+            launcher: "ghostty".to_string(),
+        };
+
+        parse_editor_settings(
+            r#"
+[editor]
+command = [
+  "fresh",
+  "--title=a,b#c",
+  "{file}",
+]
+
+[terminal]
+launcher = "ghostty#nightly"
+"#,
+            &mut settings,
+        );
+
+        assert_eq!(settings.command, vec!["fresh", "--title=a,b#c", "{file}"]);
+        assert_eq!(settings.launcher, "ghostty#nightly");
     }
 }

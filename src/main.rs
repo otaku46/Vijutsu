@@ -366,7 +366,7 @@ enum PendingMutation {
     ImportHistoricalFile {
         source_op: String,
         source: SelectedChange,
-        path: String,
+        paths: Vec<String>,
     },
     Commit {
         message: String,
@@ -454,15 +454,18 @@ impl PendingMutation {
                     change.commit_id.clone(),
                 ]
             }
-            PendingMutation::ImportHistoricalFile { source, path, .. } => vec![
-                "restore".to_string(),
-                "--from".to_string(),
-                source.commit_id.clone(),
-                "--into".to_string(),
-                "@".to_string(),
-                "--".to_string(),
-                path.clone(),
-            ],
+            PendingMutation::ImportHistoricalFile { source, paths, .. } => {
+                let mut args = vec![
+                    "restore".to_string(),
+                    "--from".to_string(),
+                    source.commit_id.clone(),
+                    "--into".to_string(),
+                    "@".to_string(),
+                    "--".to_string(),
+                ];
+                args.extend(paths.clone());
+                args
+            }
             PendingMutation::Commit { message } => {
                 vec!["commit".to_string(), "-m".to_string(), message.clone()]
             }
@@ -604,13 +607,13 @@ impl PendingMutation {
             PendingMutation::ImportHistoricalFile {
                 source_op,
                 source,
-                path,
+                paths,
             } => vec![
                 "Import historical file into current working copy".to_string(),
                 String::new(),
                 format!("source op: {}", short(source_op)),
                 format!("source commit: {}", short(&source.commit_id)),
-                format!("source path: {path}"),
+                format!("source paths: {}", paths.join(", ")),
                 "write target: current operation head (@)".to_string(),
                 String::new(),
                 "The historical operation remains read-only.".to_string(),
@@ -787,6 +790,9 @@ impl TuiApp {
 
     fn refresh_files(&mut self) {
         self.files.clear();
+        self.selected_file = 0;
+        self.selected_files.clear();
+        self.file_selection_anchor = None;
         let Some(op_id) = self.selected_operation_id() else {
             return;
         };
@@ -1231,9 +1237,9 @@ impl TuiApp {
             .enumerate()
             .map(|(index, file)| {
                 if self.selected_files.contains(&index) {
-                    format!("[x] {}", file.label)
+                    format!("* {}", file.label)
                 } else {
-                    format!("[ ] {}", file.label)
+                    format!("  {}", file.label)
                 }
             })
             .collect()
@@ -1257,31 +1263,34 @@ impl TuiApp {
         height: u16,
         modifiers: KeyModifiers,
     ) {
+        if self.overlay.is_some() {
+            return;
+        }
         let body_height = height.saturating_sub(6);
         let old_operation = self.selected_operation;
         let old_change = self.selected_change;
         let old_file = self.selected_file;
         let item_row = row.saturating_sub(1) as usize;
-        self.pane = if row >= body_height {
-            self.pane
-        } else if column < width.saturating_mul(28) / 100 {
-            self.selected_operation =
-                clamp_index(self.operation_scroll + item_row, self.operations.len());
-            UiPane::Operation
-        } else if column < width.saturating_mul(56) / 100 {
-            if row < body_height.saturating_mul(55) / 100 {
+        self.pane = match pane_at(column, row, width, height) {
+            Some(UiPane::Operation) => {
+                self.selected_operation =
+                    clamp_index(self.operation_scroll + item_row, self.operations.len());
+                UiPane::Operation
+            }
+            Some(UiPane::Change) => {
                 self.selected_change =
                     clamp_index(self.change_scroll + item_row, self.changes.len());
                 UiPane::Change
-            } else {
+            }
+            Some(UiPane::Files) => {
                 let files_top = body_height.saturating_mul(55) / 100;
                 let row_in_files = row.saturating_sub(files_top).saturating_sub(1) as usize;
                 let target = clamp_index(self.file_scroll + row_in_files, self.files.len());
                 self.select_file(target, is_command_modifier(modifiers), false);
                 UiPane::Files
             }
-        } else {
-            UiPane::Diff
+            Some(UiPane::Diff) => UiPane::Diff,
+            _ => self.pane,
         };
         self.sync_after_selection(old_operation, old_change, old_file);
         self.set_browse_status(format!("pane: {:?}", self.pane));
@@ -1857,15 +1866,27 @@ impl TuiApp {
             self.status = "cannot import from ROOT".to_string();
             return;
         }
-        let path = self.selected_file_path().to_string();
-        if path.is_empty() {
+        let mut paths = self
+            .selected_files
+            .iter()
+            .filter_map(|index| self.files.get(*index))
+            .map(|file| file.path.clone())
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            let path = self.selected_file_path().to_string();
+            if !path.is_empty() {
+                paths.push(path);
+            }
+        }
+        if paths.is_empty() {
             self.status = "no file selected for import".to_string();
             return;
         }
         self.set_pending_mutation(PendingMutation::ImportHistoricalFile {
             source_op,
             source,
-            path,
+            paths,
         });
     }
 
@@ -2377,7 +2398,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 areas[2],
             );
             if let Some(overlay) = &app.overlay {
-                let area = centered_rect(60, 55, frame.size());
+                let area = centered_rect(35, 50, frame.size());
                 frame.render_widget(Clear, area);
                 frame.render_widget(
                     Paragraph::new(styled_lines(&overlay.lines))
@@ -2464,19 +2485,34 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             continue;
         }
         let action = match key.code {
+            KeyCode::Esc if app.rebase_source.is_some() => {
+                app.rebase_source = None;
+                app.clear_overlay();
+                app.refresh_diff();
+                app.status = "rebase selection cancelled".to_string();
+                continue;
+            }
             KeyCode::Esc if app.overlay.is_some() => {
                 app.clear_overlay();
                 app.set_browse_status("overlay closed");
+                continue;
+            }
+            KeyCode::Enter
+                if app.overlay.is_some() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                app.scroll_overlay_page(-12);
+                continue;
+            }
+            KeyCode::Enter if app.overlay.is_some() => {
+                app.scroll_overlay_page(12);
                 continue;
             }
             KeyCode::Esc if app.mode == UiMode::Surgery => {
                 app.exit_surgery_mode();
                 continue;
             }
-            KeyCode::Esc if app.rebase_source.is_some() => {
-                app.rebase_source = None;
-                app.refresh_diff();
-                app.status = "rebase selection cancelled".to_string();
+            _ if app.overlay.is_some() => {
+                app.status = "overlay open; Esc closes it".to_string();
                 continue;
             }
             KeyCode::Char('1') => {
@@ -3800,7 +3836,7 @@ mod tests {
                 change_id: "change-id".to_string(),
                 commit_id: "commit-id".to_string(),
             },
-            path: "rireki.txt".to_string(),
+            paths: vec!["rireki.txt".to_string(), "note.txt".to_string()],
         };
 
         assert_eq!(mutation.command_kind(), CommandKind::ImportFromHistorical);
@@ -3814,6 +3850,7 @@ mod tests {
                 "@".to_string(),
                 "--".to_string(),
                 "rireki.txt".to_string(),
+                "note.txt".to_string(),
             ]
         );
     }
