@@ -133,7 +133,22 @@ fn parse_string_array(value: &str) -> Vec<String> {
 fn parse_string(value: &str) -> Option<String> {
     let value = value.trim();
     let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
-    Some(quoted.to_string())
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in quoted.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    Some(out)
 }
 
 fn strip_comment(raw: &str) -> &str {
@@ -320,16 +335,20 @@ launcher = "tmux"
 command = [
   "fresh",
   "--title=a,b#c",
+  "--name=\"quoted\"",
   "{file}",
 ]
 
 [terminal]
-launcher = "ghostty#nightly"
+launcher = "ghostty\"nightly"
 "#,
             &mut settings,
         );
 
-        assert_eq!(settings.command, vec!["fresh", "--title=a,b#c", "{file}"]);
-        assert_eq!(settings.launcher, "ghostty#nightly");
+        assert_eq!(
+            settings.command,
+            vec!["fresh", "--title=a,b#c", "--name=\"quoted\"", "{file}"]
+        );
+        assert_eq!(settings.launcher, "ghostty\"nightly");
     }
 }

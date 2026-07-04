@@ -39,7 +39,7 @@ use vijutsu::state::{
 };
 use vijutsu::state_fingerprint::{StateFingerprint, state_fingerprint, state_suffixes};
 use vijutsu::tui::{
-    ChangeDetails, DeltaDetails, KeyAction, UiCommand, UiPane, handle_key_input,
+    ChangeDetails, DeltaDetails, KeyAction, PreviewPanel, UiCommand, UiPane, handle_key_input,
     preview_panel_for_abandon, preview_panel_for_redo, preview_panel_for_restore,
     preview_panel_for_revert, preview_panel_for_snapshot_refresh, preview_panel_for_undo,
     render_keys, render_multiple_heads, render_observation, render_preview_panel,
@@ -402,12 +402,8 @@ enum PendingMutation {
 
 #[derive(Debug, Clone)]
 struct MutationPreview {
-    title: String,
+    panel: PreviewPanel,
     source_target: Vec<String>,
-    change_graph_effect: Vec<String>,
-    op_graph_effect: Vec<String>,
-    working_copy_effect: Vec<String>,
-    recoverability: Vec<String>,
     command: String,
 }
 
@@ -554,72 +550,63 @@ impl PendingMutation {
         let args = self.command_args();
         let command = format!("jj {}", args.join(" "));
         match self {
-            PendingMutation::Undo => MutationPreview {
-                title: "Undo last operation".to_string(),
-                source_target: vec!["target: latest operation".to_string()],
-                change_graph_effect: vec![
-                    "restore repository state from before that operation".to_string(),
-                ],
-                op_graph_effect: vec!["+1 undo operation".to_string()],
-                working_copy_effect: vec!["rewritten to the restored state".to_string()],
-                recoverability: vec!["the undo operation can itself be undone".to_string()],
+            PendingMutation::Undo => MutationPreview::new(
+                "Undo last operation",
+                vec!["target: latest operation".to_string()],
+                "restore repository state from before that operation",
+                "+1 undo operation",
+                "rewritten to the restored state",
+                "unchanged",
+                "unchanged",
+                "the undo operation can itself be undone",
                 command,
-            },
-            PendingMutation::Edit { change } => MutationPreview {
-                title: format!("Edit {}", change.brief()),
-                source_target: vec![format!("selected: {}", change.brief())],
-                change_graph_effect: vec![
-                    "selected change becomes the working-copy change (@)".to_string(),
-                    "descendants may be rebased as you edit it".to_string(),
-                ],
-                op_graph_effect: vec!["+1 edit operation".to_string()],
-                working_copy_effect: vec!["moves to selected change".to_string()],
-                recoverability: vec!["use U to undo the edit operation".to_string()],
+            ),
+            PendingMutation::Edit { change } => MutationPreview::new(
+                format!("Edit {}", change.brief()),
+                vec![format!("selected: {}", change.brief())],
+                "selected change becomes the working-copy change (@)\ndescendants may be rebased as you edit it",
+                "+1 edit operation",
+                "moves to selected change",
+                "unchanged",
+                "unchanged",
+                "use U to undo the edit operation",
                 command,
-            },
-            PendingMutation::NewChild { change } => MutationPreview {
-                title: format!("New child from {}", change.brief()),
-                source_target: vec![format!("parent: {}", change.brief())],
-                change_graph_effect: vec![
-                    "a new child change is created from the selected change".to_string(),
-                ],
-                op_graph_effect: vec!["+1 new operation".to_string()],
-                working_copy_effect: vec!["moves to the new child change".to_string()],
-                recoverability: vec!["use U to undo the new operation".to_string()],
+            ),
+            PendingMutation::NewChild { change } => MutationPreview::new(
+                format!("New child from {}", change.brief()),
+                vec![format!("parent: {}", change.brief())],
+                "a new child change is created from the selected change",
+                "+1 new operation",
+                "moves to the new child change",
+                "unchanged",
+                "unchanged",
+                "use U to undo the new operation",
                 command,
-            },
+            ),
             PendingMutation::SquashCurrent {
                 source,
                 destination,
-            } => MutationPreview {
-                title: "Squash current into parent".to_string(),
-                source_target: vec![
+            } => MutationPreview::new(
+                "Squash current into parent",
+                vec![
                     format!("source: {}", source.brief()),
                     format!("destination: {}", destination.brief()),
                 ],
-                change_graph_effect: vec![
-                    "Before             After".to_string(),
-                    String::new(),
-                    "@ C                @ empty".to_string(),
-                    "│                  │".to_string(),
-                    "○ B                ○ B+C".to_string(),
-                ],
-                op_graph_effect: vec!["+1 squash operation".to_string()],
-                working_copy_effect: vec![
-                    "current change becomes empty after its diff moves to parent".to_string(),
-                ],
-                recoverability: vec![
-                    "old commits remain recoverable through operation history until GC".to_string(),
-                ],
+                "Before             After\n\n@ C                @ empty\n│                  │\n○ B                ○ B+C",
+                "+1 squash operation",
+                "current change becomes empty after its diff moves to parent",
+                "unchanged",
+                "unchanged",
+                "old commits remain recoverable through operation history until GC",
                 command,
-            },
+            ),
             PendingMutation::Abandon {
                 change,
                 descendants,
                 bookmarks,
-            } => MutationPreview {
-                title: format!("Abandon {}", change.brief()),
-                source_target: vec![
+            } => MutationPreview::new(
+                format!("Abandon {}", change.brief()),
+                vec![
                     format!("abandoned: {}", change.brief()),
                     format!(
                         "descendants rebased: {}",
@@ -630,120 +617,103 @@ impl PendingMutation {
                         non_empty_join(bookmarks, "(none)")
                     ),
                 ],
-                change_graph_effect: vec![
-                    "Before             After".to_string(),
-                    String::new(),
-                    "@ C                @ C'".to_string(),
-                    "│                  │".to_string(),
-                    "○ B       ->       ○ A".to_string(),
-                    "│".to_string(),
-                    "○ A".to_string(),
-                ],
-                op_graph_effect: vec!["+1 abandon operation".to_string()],
-                working_copy_effect: vec!["rewritten if @ or descendants are rebased".to_string()],
-                recoverability: vec![
-                    "undo available: y".to_string(),
-                    "abandoned commits remain hidden until GC".to_string(),
-                ],
+                "Before             After\n\n@ C                @ C'\n│                  │\n○ B       ->       ○ A\n│\n○ A",
+                "+1 abandon operation",
+                "rewritten if @ or descendants are rebased",
+                "bookmarks may move if they point into abandoned history",
+                "unchanged",
+                "undo available: y\nabandoned commits remain hidden until GC",
                 command,
-            },
+            ),
             PendingMutation::Rebase {
                 source,
                 destination,
-            } => MutationPreview {
-                title: "Rebase".to_string(),
-                source_target: vec![
+            } => MutationPreview::new(
+                "Rebase",
+                vec![
                     format!("source: {}", source.brief()),
                     format!("destination: {}", destination.brief()),
                 ],
-                change_graph_effect: vec![
-                    "selected revision is moved onto the destination".to_string(),
-                    "descendants are not moved by this command".to_string(),
-                ],
-                op_graph_effect: vec!["+1 rebase operation".to_string()],
-                working_copy_effect: vec![
-                    "rewritten if the working-copy change is affected".to_string(),
-                ],
-                recoverability: vec!["use U to undo the rebase operation".to_string()],
+                "selected revision is moved onto the destination\ndescendants are not moved by this command",
+                "+1 rebase operation",
+                "rewritten if the working-copy change is affected",
+                "unchanged unless bookmarks track rebased commits",
+                "unchanged",
+                "use U to undo the rebase operation",
                 command,
-            },
-            PendingMutation::Restore { change } => MutationPreview {
-                title: format!("Restore changes in {}", change.brief()),
-                source_target: vec![format!("changes-in: {}", change.brief())],
-                change_graph_effect: vec![
-                    "selected change's diff is undone in the working copy".to_string(),
-                ],
-                op_graph_effect: vec!["+1 restore operation".to_string()],
-                working_copy_effect: vec![
-                    "rewritten by the inverse of the selected diff".to_string(),
-                ],
-                recoverability: vec!["use U to undo the restore operation".to_string()],
+            ),
+            PendingMutation::Restore { change } => MutationPreview::new(
+                format!("Restore changes in {}", change.brief()),
+                vec![format!("changes-in: {}", change.brief())],
+                "selected change's diff is undone in the working copy",
+                "+1 restore operation",
+                "rewritten by the inverse of the selected diff",
+                "unchanged",
+                "unchanged",
+                "use U to undo the restore operation",
                 command,
-            },
+            ),
             PendingMutation::ImportHistoricalFile {
                 source_op,
                 source,
                 paths,
-            } => MutationPreview {
-                title: "Import historical file into current working copy".to_string(),
-                source_target: vec![
+            } => MutationPreview::new(
+                "Import historical file into current working copy",
+                vec![
                     format!("source op: {}", short(source_op)),
                     format!("source commit: {}", short(&source.commit_id)),
                     format!("source paths: {}", paths.join(", ")),
                     "write target: current operation head (@)".to_string(),
                 ],
-                change_graph_effect: vec!["historical change graph remains read-only".to_string()],
-                op_graph_effect: vec!["+1 restore operation on current head".to_string()],
-                working_copy_effect: vec![
-                    "selected historical file content is written into @".to_string(),
-                ],
-                recoverability: vec![
-                    "source commit must remain available until GC".to_string(),
-                    "use U to undo the import operation".to_string(),
-                ],
+                "historical change graph remains read-only",
+                "+1 restore operation on current head",
+                "selected historical file content is written into @",
+                "unchanged",
+                "unchanged",
+                "source commit must remain available until GC\nuse U to undo the import operation",
                 command,
-            },
-            PendingMutation::Commit { message } => MutationPreview {
-                title: "Commit current working-copy change".to_string(),
-                source_target: vec![format!("message: {message}")],
-                change_graph_effect: vec![
-                    "current change description is updated".to_string(),
-                    "a new child change is created".to_string(),
-                ],
-                op_graph_effect: vec!["+1 commit operation".to_string()],
-                working_copy_effect: vec!["moves to the new child change".to_string()],
-                recoverability: vec!["use U to undo the commit operation".to_string()],
+            ),
+            PendingMutation::Commit { message } => MutationPreview::new(
+                "Commit current working-copy change",
+                vec![format!("message: {message}")],
+                "current change description is updated\na new child change is created",
+                "+1 commit operation",
+                "moves to the new child change",
+                "unchanged",
+                "unchanged",
+                "use U to undo the commit operation",
                 command,
-            },
-            PendingMutation::BookmarkSet { name, change } => MutationPreview {
-                title: "Set bookmark".to_string(),
-                source_target: vec![
+            ),
+            PendingMutation::BookmarkSet { name, change } => MutationPreview::new(
+                "Set bookmark",
+                vec![
                     format!("bookmark: {name}"),
                     format!("target: {}", change.brief()),
                 ],
-                change_graph_effect: vec!["change graph is unchanged".to_string()],
-                op_graph_effect: vec!["+1 bookmark operation".to_string()],
-                working_copy_effect: vec!["unchanged".to_string()],
-                recoverability: vec!["use U to undo the bookmark move".to_string()],
+                "change graph is unchanged",
+                "+1 bookmark operation",
+                "unchanged",
+                "local bookmark moves",
+                "remote tracking unchanged until push",
+                "use U to undo the bookmark move",
                 command,
-            },
+            ),
             PendingMutation::Push { bookmark } => {
                 let mut source_target = vec!["remote/bookmark: repository default".to_string()];
                 if let Some(bookmark) = bookmark {
                     source_target = vec![format!("bookmark: {bookmark}")];
                 }
-                MutationPreview {
-                    title: "Push to Git remote".to_string(),
+                MutationPreview::new(
+                    "Push to Git remote",
                     source_target,
-                    change_graph_effect: vec!["local change graph is unchanged".to_string()],
-                    op_graph_effect: vec!["no local jj operation is expected".to_string()],
-                    working_copy_effect: vec!["unchanged".to_string()],
-                    recoverability: vec![
-                        "remote bookmark movement depends on remote policy".to_string(),
-                        "local operation undo does not necessarily undo a remote push".to_string(),
-                    ],
+                    "local change graph is unchanged",
+                    "no local jj operation is expected",
+                    "unchanged",
+                    "local bookmarks unchanged",
+                    "remote bookmark may move",
+                    "remote bookmark movement depends on remote policy\nlocal operation undo does not necessarily undo a remote push",
                     command,
-                }
+                )
             }
         }
     }
@@ -754,13 +724,53 @@ impl PendingMutation {
 }
 
 impl MutationPreview {
+    fn new(
+        title: impl Into<String>,
+        source_target: Vec<String>,
+        change_graph_effect: impl Into<String>,
+        operation_graph_effect: impl Into<String>,
+        working_copy_effect: impl Into<String>,
+        bookmark_effect: impl Into<String>,
+        remote_tracking_effect: impl Into<String>,
+        recoverability_effect: impl Into<String>,
+        command: String,
+    ) -> Self {
+        Self {
+            panel: PreviewPanel {
+                title: title.into(),
+                change_graph_effect: change_graph_effect.into(),
+                operation_graph_effect: operation_graph_effect.into(),
+                working_copy_effect: working_copy_effect.into(),
+                bookmark_effect: bookmark_effect.into(),
+                remote_tracking_effect: remote_tracking_effect.into(),
+                recoverability_effect: recoverability_effect.into(),
+            },
+            source_target,
+            command,
+        }
+    }
+
     fn lines(&self) -> Vec<String> {
-        let mut lines = vec![self.title.clone(), String::new()];
+        let mut lines = vec![self.panel.title.clone(), String::new()];
         push_section(&mut lines, "Target", &self.source_target);
-        push_section(&mut lines, "Change graph", &self.change_graph_effect);
-        push_section(&mut lines, "Operation graph", &self.op_graph_effect);
-        push_section(&mut lines, "Working copy", &self.working_copy_effect);
-        push_section(&mut lines, "Recoverability", &self.recoverability);
+        push_section_text(&mut lines, "Change graph", &self.panel.change_graph_effect);
+        push_section_text(
+            &mut lines,
+            "Operation graph",
+            &self.panel.operation_graph_effect,
+        );
+        push_section_text(&mut lines, "Working copy", &self.panel.working_copy_effect);
+        push_section_text(&mut lines, "Bookmarks", &self.panel.bookmark_effect);
+        push_section_text(
+            &mut lines,
+            "Remote tracking",
+            &self.panel.remote_tracking_effect,
+        );
+        push_section_text(
+            &mut lines,
+            "Recoverability",
+            &self.panel.recoverability_effect,
+        );
         push_section(&mut lines, "Command", std::slice::from_ref(&self.command));
         lines.push(String::new());
         lines.push("Press y to execute, Esc or N to cancel.".to_string());
@@ -778,6 +788,11 @@ fn push_section(lines: &mut Vec<String>, title: &str, values: &[String]) {
         }
     }
     lines.push(String::new());
+}
+
+fn push_section_text(lines: &mut Vec<String>, title: &str, value: &str) {
+    let values = value.lines().map(str::to_string).collect::<Vec<_>>();
+    push_section(lines, title, &values);
 }
 
 impl SelectedChange {
@@ -1477,7 +1492,7 @@ impl TuiApp {
         let old_change = self.selected_change;
         let old_file = self.selected_file;
         let item_row = row.saturating_sub(1) as usize;
-        self.pane = match pane_at(column, row, width, height) {
+        self.pane = match pane_at(column, row, width, height, self.maximized_pane) {
             Some(UiPane::Operation) => {
                 self.selected_operation =
                     clamp_index(self.operation_scroll + item_row, self.operations.len());
@@ -1489,8 +1504,12 @@ impl TuiApp {
                 UiPane::Change
             }
             Some(UiPane::Files) => {
-                let files_top = body_height.saturating_mul(55) / 100;
-                let row_in_files = row.saturating_sub(files_top).saturating_sub(1) as usize;
+                let row_in_files = if matches!(self.maximized_pane, Some(UiPane::Files)) {
+                    item_row
+                } else {
+                    let files_top = body_height.saturating_mul(55) / 100;
+                    row.saturating_sub(files_top).saturating_sub(1) as usize
+                };
                 let target = clamp_index(self.file_scroll + row_in_files, self.files.len());
                 self.select_file(target, is_command_modifier(modifiers), false);
                 UiPane::Files
@@ -1507,7 +1526,7 @@ impl TuiApp {
             self.scroll_overlay_page((delta * 3) as i16);
             return;
         }
-        self.pane = pane_at(column, row, width, height).unwrap_or(self.pane);
+        self.pane = pane_at(column, row, width, height, self.maximized_pane).unwrap_or(self.pane);
         match self.pane {
             UiPane::Diff => self.scroll_detail_page((delta * 3) as i16),
             _ => self.move_selection(delta),
@@ -2530,7 +2549,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 areas[2],
             );
             if let Some((title, lines, scroll)) = app.modal_overlay() {
-                let area = centered_rect(35, 50, frame.size());
+                let area = centered_rect(40, 50, frame.size());
                 frame.render_widget(Clear, area);
                 frame.render_widget(
                     Paragraph::new(styled_lines(&lines))
@@ -2620,28 +2639,42 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 }
                 continue;
             }
+            ActiveModal::Rebase { .. } => {
+                match key.code {
+                    KeyCode::Enter => app.finish_rebase_selection(),
+                    KeyCode::Esc | KeyCode::Char('N') => {
+                        app.modal = ActiveModal::None;
+                        app.refresh_diff();
+                        app.status = "rebase selection cancelled".to_string();
+                    }
+                    _ => {
+                        app.status =
+                            "rebase selection: choose destination, Enter confirm, Esc/N cancel"
+                                .to_string()
+                    }
+                }
+                continue;
+            }
+            ActiveModal::Overlay(_) => {
+                match key.code {
+                    KeyCode::Esc if app.mode == UiMode::Surgery => app.exit_surgery_mode(),
+                    KeyCode::Esc => {
+                        app.clear_overlay();
+                        app.set_browse_status("overlay closed");
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        app.scroll_overlay_page(-12);
+                    }
+                    KeyCode::Enter => {
+                        app.scroll_overlay_page(12);
+                    }
+                    _ => app.status = "overlay open; Esc closes it".to_string(),
+                }
+                continue;
+            }
             _ => {}
         }
         let action = match key.code {
-            KeyCode::Esc if matches!(app.modal, ActiveModal::Rebase { .. }) => {
-                app.modal = ActiveModal::None;
-                app.refresh_diff();
-                app.status = "rebase selection cancelled".to_string();
-                continue;
-            }
-            KeyCode::Esc if app.has_modal() => {
-                app.clear_overlay();
-                app.set_browse_status("overlay closed");
-                continue;
-            }
-            KeyCode::Enter if app.has_modal() && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                app.scroll_overlay_page(-12);
-                continue;
-            }
-            KeyCode::Enter if app.has_modal() => {
-                app.scroll_overlay_page(12);
-                continue;
-            }
             KeyCode::Esc if app.mode == UiMode::Surgery => {
                 app.exit_surgery_mode();
                 continue;
@@ -2805,10 +2838,6 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 if !app.scroll_overlay_page(-12) {
                     app.scroll_detail_page(-12);
                 }
-                continue;
-            }
-            KeyCode::Enter if matches!(app.modal, ActiveModal::Rebase { .. }) => {
-                app.finish_rebase_selection();
                 continue;
             }
             KeyCode::Enter => {
@@ -3005,16 +3034,20 @@ fn load_operations() -> Result<(String, String, Vec<TuiOperation>), String> {
 }
 
 fn annotate_operation_states(version: &str, operations: &mut [TuiOperation]) {
-    let fingerprints = operations
+    // ponytail: each fingerprint spawns jj; make this async/cached before raising the limit.
+    const STATE_FINGERPRINT_LIMIT: usize = 16;
+    let visible_len = operations.len().min(STATE_FINGERPRINT_LIMIT);
+    let (visible_operations, _) = operations.split_at_mut(visible_len);
+    let fingerprints = visible_operations
         .iter()
         .map(|operation| operation_state_fingerprint(version, &operation.id))
         .collect::<Vec<_>>();
-    let op_ids = operations
+    let op_ids = visible_operations
         .iter()
         .map(|operation| operation.id.clone())
         .collect::<Vec<_>>();
 
-    for (operation, suffix) in operations
+    for (operation, suffix) in visible_operations
         .iter_mut()
         .zip(state_suffixes(&op_ids, &fingerprints))
     {
@@ -3186,10 +3219,19 @@ fn is_command_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::META)
 }
 
-fn pane_at(column: u16, row: u16, width: u16, height: u16) -> Option<UiPane> {
+fn pane_at(
+    column: u16,
+    row: u16,
+    width: u16,
+    height: u16,
+    maximized_pane: Option<UiPane>,
+) -> Option<UiPane> {
     let body_height = height.saturating_sub(6);
     if row >= body_height {
         return None;
+    }
+    if let Some(pane) = maximized_pane {
+        return Some(pane);
     }
     if column < width.saturating_mul(28) / 100 {
         Some(UiPane::Operation)
