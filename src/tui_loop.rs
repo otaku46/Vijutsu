@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -19,7 +19,8 @@ use crate::editor::{ConfiguredLauncher, OpenRequest, TerminalLauncher, load_edit
 use crate::tui::{KeyAction, UiCommand, UiPane, handle_key_input};
 use crate::tui_app::{ActiveModal, TuiApp, UiMode};
 use crate::tui_runtime::{
-    diff_side_lines, focused_block, selectable_list, styled_diff_lines, styled_lines, visible_from,
+    diff_side_lines, focused_block, highlighted_diff_lines, selectable_list, styled_lines,
+    visible_from,
 };
 use crate::tui_support::{centered_rect, is_command_modifier};
 
@@ -36,12 +37,13 @@ fn run_tui() -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = tui_loop(&mut terminal);
-    disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
+    terminal.backend_mut().flush()?;
+    disable_raw_mode()?;
     terminal.show_cursor()?;
     result
 }
@@ -127,7 +129,15 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 );
             };
             let render_diff = |frame: &mut ratatui::Frame<'_>, area| {
+                let diff_path = app.selected_file_path();
                 if app.maximized_pane == Some(UiPane::Diff) {
+                    let diff_name = if diff_path.is_empty() {
+                        "diff"
+                    } else {
+                        diff_path
+                    };
+                    let removed_title = format!("{diff_name} removed");
+                    let added_title = format!("{diff_name} added");
                     let panes = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -135,9 +145,9 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                     let deleted = diff_side_lines(&app.detail, false);
                     let added = diff_side_lines(&app.detail, true);
                     frame.render_widget(
-                        Paragraph::new(styled_diff_lines(&deleted))
+                        Paragraph::new(highlighted_diff_lines(&deleted, diff_path))
                             .block(focused_block(
-                                "- removed",
+                                &removed_title,
                                 app.pane == UiPane::Diff,
                                 Color::Red,
                             ))
@@ -146,9 +156,9 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                         panes[0],
                     );
                     frame.render_widget(
-                        Paragraph::new(styled_diff_lines(&added))
+                        Paragraph::new(highlighted_diff_lines(&added, diff_path))
                             .block(focused_block(
-                                "+ added",
+                                &added_title,
                                 app.pane == UiPane::Diff,
                                 Color::Green,
                             ))
@@ -158,7 +168,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                     );
                 } else {
                     frame.render_widget(
-                        Paragraph::new(styled_diff_lines(&app.detail))
+                        Paragraph::new(highlighted_diff_lines(&app.detail, diff_path))
                             .block(focused_block(
                                 app.detail_title.as_str(),
                                 app.pane == UiPane::Diff,
