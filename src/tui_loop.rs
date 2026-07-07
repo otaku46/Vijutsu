@@ -481,7 +481,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.plan_restore_selected();
                 continue;
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('L') => {
                 app.plan_split_selected();
                 continue;
             }
@@ -501,7 +501,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.show_help();
                 continue;
             }
-            KeyCode::Char('L') => {
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.show_command_log();
                 continue;
             }
@@ -511,6 +511,10 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             }
             KeyCode::Char('h') => {
                 app.move_graph_relative(true);
+                continue;
+            }
+            KeyCode::Char('l') => {
+                app.move_graph_relative(false);
                 continue;
             }
             KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -650,7 +654,7 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
         (UiMode::Surgery, UiPane::Operation | UiPane::Repository) => &[
             ("Tab", "Pane"),
             ("j/k", "Move"),
-            ("h", "Graph parent"),
+            ("h/l", "Graph"),
             ("a", "preview abandon"),
             ("Esc", "Browse"),
             ("z", "max"),
@@ -660,7 +664,7 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
         (_, UiPane::Operation | UiPane::Repository) => &[
             ("Tab", "Pane"),
             ("j/k", "Move"),
-            ("h", "Graph parent"),
+            ("h/l", "Graph"),
             ("Enter", "detail"),
             ("r", "refresh"),
             ("R", "snapshot"),
@@ -672,11 +676,11 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
         (_, UiPane::Change) => &[
             ("Tab", "Pane"),
             ("j/k", "Move"),
-            ("h", "Graph parent"),
+            ("h/l", "Graph"),
             ("Space", "Pin"),
             ("e", "edit"),
             ("n", "new"),
-            ("l", "split"),
+            ("L", "split"),
             ("D", "duplicate"),
             ("d", "describe"),
             ("a", "abandon"),
@@ -709,7 +713,7 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
             ("R", "snapshot"),
             ("z", "max"),
             ("S-←/→", "fold op"),
-            ("L", "log"),
+            ("C-l", "log"),
             ("?", "help"),
         ],
     }

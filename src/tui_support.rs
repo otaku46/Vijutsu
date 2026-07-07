@@ -24,13 +24,13 @@ pub fn command_result_lines(result: &crate::cli::CommandResult) -> Vec<String> {
 pub fn pane_mode_help() -> Vec<String> {
     [
         "Operation pane",
-        "  j/k move    h graph parent",
+        "  j/k move    h/l graph parent/child",
         "  Enter show operation detail",
         "  S surgery mode (a preview abandon, Esc back)",
         "  historical op: read-only, import via Files",
         "",
         "Change pane",
-        "  e edit    n new child    l split    D duplicate",
+        "  e edit    n new child    L split    D duplicate",
         "  d describe",
         "  a abandon    s squash    b rebase",
         "  Z restore    Space pin/compare",
@@ -49,7 +49,7 @@ pub fn pane_mode_help() -> Vec<String> {
         "  r refresh    R snapshot    z maximize",
         "  Shift+Left collapse OP    Shift+Right restore OP",
         "  B bookmark    W add workspace    p push",
-        "  L command log    ? this help    q quit",
+        "  Ctrl-l command log    ? this help    q quit",
     ]
     .iter()
     .map(|line| line.to_string())
