@@ -354,6 +354,7 @@ pub fn render_keys() -> String {
         "O: open selected file externally",
         "c: commit current change",
         "B: set or move local bookmark to selected change",
+        "W: add workspace at typed directory",
         "p: push to git remote",
         "e: edit selected change",
         "n: new child from selected change",

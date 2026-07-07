@@ -281,6 +281,19 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 }
                 continue;
             }
+            ActiveModal::Workspace { .. } => {
+                match key.code {
+                    KeyCode::Enter => app.confirm_workspace_input(),
+                    KeyCode::Esc => app.cancel_workspace_input(),
+                    KeyCode::Backspace => app.pop_workspace_char(),
+                    KeyCode::Char(ch) => app.push_workspace_char(ch),
+                    _ => {
+                        app.status =
+                            "workspace input: type path, Enter confirm, Esc cancel".to_string()
+                    }
+                }
+                continue;
+            }
             ActiveModal::PendingMutation { .. } => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => app.execute_pending_mutation(),
@@ -423,6 +436,10 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             }
             KeyCode::Char('B') => {
                 app.begin_bookmark_input();
+                continue;
+            }
+            KeyCode::Char('W') => {
+                app.begin_workspace_input();
                 continue;
             }
             KeyCode::Char('p') => {
@@ -584,6 +601,13 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
             return &[
                 ("Enter", "apply"),
                 ("Esc/N", "cancel"),
+                ("Backspace", "delete"),
+            ];
+        }
+        ActiveModal::Workspace { .. } => {
+            return &[
+                ("Enter", "apply"),
+                ("Esc", "cancel"),
                 ("Backspace", "delete"),
             ];
         }

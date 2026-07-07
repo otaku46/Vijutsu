@@ -422,6 +422,54 @@ impl TuiApp {
         });
     }
 
+    pub fn begin_workspace_input(&mut self) {
+        if self.block_historical_mutation("workspace add") {
+            return;
+        }
+        self.modal = ActiveModal::Workspace {
+            input: WorkspaceInput {
+                path: String::new(),
+            },
+            scroll: 0,
+        };
+        self.status = "workspace input".to_string();
+    }
+
+    pub fn push_workspace_char(&mut self, ch: char) {
+        if let ActiveModal::Workspace { input, .. } = &mut self.modal {
+            input.path.push(ch);
+        }
+    }
+
+    pub fn pop_workspace_char(&mut self) {
+        if let ActiveModal::Workspace { input, .. } = &mut self.modal {
+            input.path.pop();
+        }
+    }
+
+    pub fn cancel_workspace_input(&mut self) {
+        self.modal = ActiveModal::None;
+        self.refresh_diff();
+        self.status = "workspace add cancelled".to_string();
+    }
+
+    pub fn confirm_workspace_input(&mut self) {
+        if self.block_historical_mutation("workspace add") {
+            return;
+        }
+        let ActiveModal::Workspace { input, .. } =
+            std::mem::replace(&mut self.modal, ActiveModal::None)
+        else {
+            return;
+        };
+        let path = input.path.trim().to_string();
+        if path.is_empty() {
+            self.status = "workspace path is empty; cancelled".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::WorkspaceAdd { path });
+    }
+
     pub fn plan_push(&mut self) {
         if self.block_historical_mutation("push") {
             return;

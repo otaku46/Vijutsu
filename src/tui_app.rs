@@ -74,6 +74,10 @@ pub enum ActiveModal {
         input: BookmarkInput,
         scroll: u16,
     },
+    Workspace {
+        input: WorkspaceInput,
+        scroll: u16,
+    },
     PendingMutation {
         mutation: PendingMutation,
         scroll: u16,
@@ -103,6 +107,10 @@ pub struct CommitInput {
 pub struct BookmarkInput {
     pub change: SelectedChange,
     pub name: String,
+}
+
+pub struct WorkspaceInput {
+    pub path: String,
 }
 
 impl Default for TuiApp {

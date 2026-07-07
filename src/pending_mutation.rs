@@ -43,6 +43,9 @@ pub enum PendingMutation {
     Push {
         bookmark: Option<String>,
     },
+    WorkspaceAdd {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +71,7 @@ impl PendingMutation {
             PendingMutation::Commit { .. } => "commit current change",
             PendingMutation::BookmarkSet { .. } => "set bookmark on selected change",
             PendingMutation::Push { .. } => "push to git remote",
+            PendingMutation::WorkspaceAdd { .. } => "add workspace",
         }
     }
 
@@ -135,6 +139,9 @@ impl PendingMutation {
                 }
                 args
             }
+            PendingMutation::WorkspaceAdd { path } => {
+                vec!["workspace".to_string(), "add".to_string(), path.clone()]
+            }
         }
     }
 
@@ -150,7 +157,8 @@ impl PendingMutation {
             PendingMutation::Undo
             | PendingMutation::Abandon { .. }
             | PendingMutation::Commit { .. }
-            | PendingMutation::Push { .. } => None,
+            | PendingMutation::Push { .. }
+            | PendingMutation::WorkspaceAdd { .. } => None,
         }
     }
 
@@ -166,7 +174,8 @@ impl PendingMutation {
             | PendingMutation::Restore { .. }
             | PendingMutation::Commit { .. }
             | PendingMutation::BookmarkSet { .. }
-            | PendingMutation::Push { .. } => CommandKind::MutateCurrent,
+            | PendingMutation::Push { .. }
+            | PendingMutation::WorkspaceAdd { .. } => CommandKind::MutateCurrent,
         }
     }
 
@@ -339,6 +348,20 @@ impl PendingMutation {
                     command,
                 )
             }
+            PendingMutation::WorkspaceAdd { path } => MutationPreview::new(
+                "Add workspace",
+                vec![
+                    format!("directory: {path}"),
+                    "workspace name: directory basename".to_string(),
+                ],
+                "a new working-copy change (@) is created for the new workspace",
+                "+1 workspace add operation",
+                "current workspace unchanged; new workspace gets its own @",
+                "unchanged",
+                "unchanged",
+                "use U to undo; jj workspace forget removes the workspace",
+                command,
+            ),
         }
     }
 
@@ -431,6 +454,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_add_uses_typed_directory() {
+        let mutation = PendingMutation::WorkspaceAdd {
+            path: "../vijutsu-agent".to_string(),
+        };
+
+        assert_eq!(mutation.command_kind(), CommandKind::MutateCurrent);
+        assert_eq!(
+            mutation.command_args(),
+            vec![
+                "workspace".to_string(),
+                "add".to_string(),
+                "../vijutsu-agent".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn push_selected_bookmark_uses_bookmark_arg() {
         let mutation = PendingMutation::Push {
             bookmark: Some("feature".to_string()),
@@ -513,6 +553,9 @@ mod tests {
             },
             PendingMutation::Push {
                 bookmark: Some("feature".to_string()),
+            },
+            PendingMutation::WorkspaceAdd {
+                path: "../vijutsu-agent".to_string(),
             },
         ];
 

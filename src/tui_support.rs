@@ -46,6 +46,7 @@ pub fn pane_mode_help() -> Vec<String> {
         "Global",
         "  Tab / Shift+Tab switch pane    1-4 focus pane",
         "  r refresh    R snapshot    z maximize",
+        "  B bookmark    W add workspace    p push",
         "  L command log    ? this help    q quit",
     ]
     .iter()

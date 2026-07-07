@@ -22,6 +22,7 @@ impl TuiApp {
             ActiveModal::Describe { scroll, .. }
             | ActiveModal::Commit { scroll, .. }
             | ActiveModal::Bookmark { scroll, .. }
+            | ActiveModal::Workspace { scroll, .. }
             | ActiveModal::PendingMutation { scroll, .. }
             | ActiveModal::Rebase { scroll, .. } => scroll,
             ActiveModal::None => return false,
@@ -67,6 +68,16 @@ impl TuiApp {
                     "Enter: confirm, Esc/N: cancel, Backspace: delete".to_string(),
                     String::new(),
                     input.name.clone(),
+                ],
+                *scroll,
+            )),
+            ActiveModal::Workspace { input, scroll } => Some((
+                "Add workspace".to_string(),
+                vec![
+                    "Type workspace directory path.".to_string(),
+                    "Enter: confirm, Esc: cancel, Backspace: delete".to_string(),
+                    String::new(),
+                    input.path.clone(),
                 ],
                 *scroll,
             )),
@@ -196,6 +207,10 @@ impl TuiApp {
             ActiveModal::Bookmark { input, .. } => Some(InputCursor {
                 line: 3,
                 column: input.name.chars().count() as u16,
+            }),
+            ActiveModal::Workspace { input, .. } => Some(InputCursor {
+                line: 3,
+                column: input.path.chars().count() as u16,
             }),
             _ => None,
         }
