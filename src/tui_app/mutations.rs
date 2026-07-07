@@ -181,6 +181,53 @@ impl TuiApp {
         self.set_pending_mutation(PendingMutation::Restore { change });
     }
 
+    pub fn plan_split_selected(&mut self) {
+        if self.block_historical_mutation("split") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&change.commit_id) {
+            self.status = "cannot split ROOT".to_string();
+            return;
+        }
+        let mut paths = self
+            .selected_files
+            .iter()
+            .filter_map(|index| self.files.get(*index))
+            .map(|file| file.path.clone())
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            let path = self.selected_file_path().to_string();
+            if !path.is_empty() {
+                paths.push(path);
+            }
+        }
+        if paths.is_empty() {
+            self.status = "select a file to split".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::Split { change, paths });
+    }
+
+    pub fn plan_duplicate_selected(&mut self) {
+        if self.block_historical_mutation("duplicate") {
+            return;
+        }
+        let Some(change) = self.selected_change() else {
+            self.status = "no change selected".to_string();
+            return;
+        };
+        if is_root_commit(&change.commit_id) {
+            self.status = "cannot duplicate ROOT".to_string();
+            return;
+        }
+        self.set_pending_mutation(PendingMutation::Duplicate { change });
+    }
+
     pub fn plan_import_historical_file(&mut self) {
         if self.block_command("import historical file", CommandKind::ImportFromHistorical) {
             return;

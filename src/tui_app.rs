@@ -22,6 +22,7 @@ pub struct TuiApp {
     pub detail: Vec<String>,
     pub modal: ActiveModal,
     pub maximized_pane: Option<UiPane>,
+    pub operation_pane_collapsed: bool,
     pub selected_operation: usize,
     pub selected_change: usize,
     pub selected_file: usize,
@@ -134,6 +135,7 @@ impl TuiApp {
             ],
             modal: ActiveModal::None,
             maximized_pane: None,
+            operation_pane_collapsed: false,
             selected_operation: 0,
             selected_change: 0,
             selected_file: 0,
@@ -330,8 +332,22 @@ impl TuiApp {
         });
     }
 
+    pub fn collapse_operation_pane(&mut self) {
+        self.operation_pane_collapsed = true;
+        if self.pane == UiPane::Operation || self.pane == UiPane::Repository {
+            self.pane = UiPane::Change;
+        }
+        self.set_browse_status("operation pane collapsed");
+    }
+
+    pub fn restore_operation_pane(&mut self) {
+        self.operation_pane_collapsed = false;
+        self.set_browse_status("operation pane restored");
+    }
+
     pub fn enter_surgery_mode(&mut self) {
         self.mode = UiMode::Surgery;
+        self.operation_pane_collapsed = false;
         self.pane = UiPane::Operation;
         self.status = "operation graph surgery; Operation pane actions only".to_string();
     }

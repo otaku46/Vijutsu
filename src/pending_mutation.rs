@@ -28,6 +28,13 @@ pub enum PendingMutation {
     Restore {
         change: SelectedChange,
     },
+    Split {
+        change: SelectedChange,
+        paths: Vec<String>,
+    },
+    Duplicate {
+        change: SelectedChange,
+    },
     ImportHistoricalFile {
         source_op: String,
         source: SelectedChange,
@@ -65,6 +72,8 @@ impl PendingMutation {
             PendingMutation::Abandon { .. } => "abandon selected change",
             PendingMutation::Rebase { .. } => "rebase selected change",
             PendingMutation::Restore { .. } => "restore selected change",
+            PendingMutation::Split { .. } => "split selected change",
+            PendingMutation::Duplicate { .. } => "duplicate selected change",
             PendingMutation::ImportHistoricalFile { .. } => {
                 "import historical file into current working copy"
             }
@@ -109,6 +118,20 @@ impl PendingMutation {
                     change.commit_id.clone(),
                 ]
             }
+            PendingMutation::Split { change, paths } => {
+                let mut args = vec![
+                    "split".to_string(),
+                    "-r".to_string(),
+                    change.commit_id.clone(),
+                    "-m".to_string(),
+                    "split".to_string(),
+                ];
+                args.extend(paths.clone());
+                args
+            }
+            PendingMutation::Duplicate { change } => {
+                vec!["duplicate".to_string(), change.commit_id.clone()]
+            }
             PendingMutation::ImportHistoricalFile { source, paths, .. } => {
                 let mut args = vec![
                     "restore".to_string(),
@@ -152,6 +175,8 @@ impl PendingMutation {
             | PendingMutation::SquashCurrent { source: change, .. }
             | PendingMutation::Rebase { source: change, .. }
             | PendingMutation::Restore { change }
+            | PendingMutation::Split { change, .. }
+            | PendingMutation::Duplicate { change }
             | PendingMutation::BookmarkSet { change, .. } => Some(&change.change_id),
             PendingMutation::ImportHistoricalFile { .. } => None,
             PendingMutation::Undo
@@ -172,6 +197,8 @@ impl PendingMutation {
             | PendingMutation::Abandon { .. }
             | PendingMutation::Rebase { .. }
             | PendingMutation::Restore { .. }
+            | PendingMutation::Split { .. }
+            | PendingMutation::Duplicate { .. }
             | PendingMutation::Commit { .. }
             | PendingMutation::BookmarkSet { .. }
             | PendingMutation::Push { .. }
@@ -284,6 +311,31 @@ impl PendingMutation {
                 "unchanged",
                 "unchanged",
                 "use U to undo the restore operation",
+                command,
+            ),
+            PendingMutation::Split { change, paths } => MutationPreview::new(
+                format!("Split {}", change.brief()),
+                vec![
+                    format!("revision: {}", change.brief()),
+                    format!("filesets: {}", paths.join(", ")),
+                ],
+                "selected file changes are extracted into a new revision",
+                "+1 split operation",
+                "working copy may move if @ is affected",
+                "unchanged",
+                "unchanged",
+                "use U to undo the split operation",
+                command,
+            ),
+            PendingMutation::Duplicate { change } => MutationPreview::new(
+                format!("Duplicate {}", change.brief()),
+                vec![format!("revision: {}", change.brief())],
+                "a new change is created with the same content as the selected change",
+                "+1 duplicate operation",
+                "unchanged unless @ is affected by descendant rebases",
+                "unchanged",
+                "unchanged",
+                "use U to undo the duplicate operation",
                 command,
             ),
             PendingMutation::ImportHistoricalFile {
@@ -510,6 +562,34 @@ mod tests {
     }
 
     #[test]
+    fn split_and_duplicate_use_selected_revision() {
+        let change = SelectedChange {
+            change_id: "change-id".to_string(),
+            commit_id: "commit-id".to_string(),
+        };
+
+        assert_eq!(
+            PendingMutation::Split {
+                change: change.clone(),
+                paths: vec!["rireki.txt".to_string()],
+            }
+            .command_args(),
+            vec![
+                "split".to_string(),
+                "-r".to_string(),
+                "commit-id".to_string(),
+                "-m".to_string(),
+                "split".to_string(),
+                "rireki.txt".to_string(),
+            ]
+        );
+        assert_eq!(
+            PendingMutation::Duplicate { change }.command_args(),
+            vec!["duplicate".to_string(), "commit-id".to_string()]
+        );
+    }
+
+    #[test]
     fn mutation_preview_always_shows_effect_sections() {
         let change = SelectedChange {
             change_id: "change-id".to_string(),
@@ -539,6 +619,13 @@ mod tests {
             PendingMutation::Restore {
                 change: change.clone(),
             },
+            PendingMutation::Split {
+                change: change.clone(),
+                paths: vec!["rireki.txt".to_string()],
+            },
+            PendingMutation::Duplicate {
+                change: change.clone(),
+            },
             PendingMutation::ImportHistoricalFile {
                 source_op: "op-old".to_string(),
                 source: change.clone(),
@@ -549,7 +636,7 @@ mod tests {
             },
             PendingMutation::BookmarkSet {
                 name: "feature".to_string(),
-                change,
+                change: change.clone(),
             },
             PendingMutation::Push {
                 bookmark: Some("feature".to_string()),

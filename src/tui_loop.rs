@@ -72,11 +72,19 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 .split(frame.size());
             let body = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(28),
-                    Constraint::Percentage(28),
-                    Constraint::Percentage(44),
-                ])
+                .constraints(if app.operation_pane_collapsed {
+                    [
+                        Constraint::Length(0),
+                        Constraint::Percentage(36),
+                        Constraint::Percentage(64),
+                    ]
+                } else {
+                    [
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(44),
+                    ]
+                })
                 .split(areas[0]);
             let middle = Layout::default()
                 .direction(Direction::Vertical)
@@ -187,7 +195,9 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 Some(UiPane::Files) => render_files(frame, areas[0]),
                 Some(UiPane::Diff) => render_diff(frame, areas[0]),
                 None => {
-                    render_operation(frame, body[0]);
+                    if !app.operation_pane_collapsed {
+                        render_operation(frame, body[0]);
+                    }
                     render_change(frame, middle[0]);
                     render_files(frame, middle[1]);
                     render_diff(frame, body[2]);
@@ -364,6 +374,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 continue;
             }
             KeyCode::Char('1') => {
+                app.restore_operation_pane();
                 app.pane = UiPane::Operation;
                 app.set_browse_status("pane: Operation");
                 continue;
@@ -470,6 +481,14 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.plan_restore_selected();
                 continue;
             }
+            KeyCode::Char('l') => {
+                app.plan_split_selected();
+                continue;
+            }
+            KeyCode::Char('D') => {
+                app.plan_duplicate_selected();
+                continue;
+            }
             KeyCode::Char('z') => {
                 app.toggle_maximize_pane();
                 continue;
@@ -494,8 +513,12 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 app.move_graph_relative(true);
                 continue;
             }
-            KeyCode::Char('l') => {
-                app.move_graph_relative(false);
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.collapse_operation_pane();
+                continue;
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.restore_operation_pane();
                 continue;
             }
             KeyCode::Up if is_command_modifier(key.modifiers) => {
@@ -627,36 +650,41 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
         (UiMode::Surgery, UiPane::Operation | UiPane::Repository) => &[
             ("Tab", "Pane"),
             ("j/k", "Move"),
-            ("h/l", "Graph"),
+            ("h", "Graph parent"),
             ("a", "preview abandon"),
             ("Esc", "Browse"),
             ("z", "max"),
+            ("S-←/→", "fold op"),
             ("?", "help"),
         ],
         (_, UiPane::Operation | UiPane::Repository) => &[
             ("Tab", "Pane"),
             ("j/k", "Move"),
-            ("h/l", "Graph"),
+            ("h", "Graph parent"),
             ("Enter", "detail"),
             ("r", "refresh"),
             ("R", "snapshot"),
             ("S", "Surgery"),
             ("z", "max"),
+            ("S-←/→", "fold op"),
             ("?", "help"),
         ],
         (_, UiPane::Change) => &[
             ("Tab", "Pane"),
             ("j/k", "Move"),
-            ("h/l", "Graph"),
+            ("h", "Graph parent"),
             ("Space", "Pin"),
             ("e", "edit"),
             ("n", "new"),
+            ("l", "split"),
+            ("D", "duplicate"),
             ("d", "describe"),
             ("a", "abandon"),
             ("s", "squash"),
             ("b", "rebase"),
             ("Z", "restore"),
             ("z", "max"),
+            ("S-←/→", "fold op"),
             ("?", "help"),
         ],
         (_, UiPane::Files) => &[
@@ -669,6 +697,7 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
             ("I", "import"),
             ("r", "refresh"),
             ("z", "max"),
+            ("S-←/→", "fold op"),
             ("?", "help"),
         ],
         (_, UiPane::Diff) => &[
@@ -679,6 +708,7 @@ fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
             ("r", "refresh"),
             ("R", "snapshot"),
             ("z", "max"),
+            ("S-←/→", "fold op"),
             ("L", "log"),
             ("?", "help"),
         ],

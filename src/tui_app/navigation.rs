@@ -32,7 +32,14 @@ impl TuiApp {
         let old_change = self.selected_change;
         let old_file = self.selected_file;
         let item_row = row.saturating_sub(1) as usize;
-        self.pane = match pane_at(column, row, width, height, self.maximized_pane) {
+        self.pane = match pane_at(
+            column,
+            row,
+            width,
+            height,
+            self.maximized_pane,
+            self.operation_pane_collapsed,
+        ) {
             Some(UiPane::Operation) => {
                 self.selected_operation =
                     clamp_index(self.operation_scroll + item_row, self.operations.len());
@@ -66,7 +73,15 @@ impl TuiApp {
             self.scroll_overlay_page((delta * 3) as i16);
             return;
         }
-        self.pane = pane_at(column, row, width, height, self.maximized_pane).unwrap_or(self.pane);
+        self.pane = pane_at(
+            column,
+            row,
+            width,
+            height,
+            self.maximized_pane,
+            self.operation_pane_collapsed,
+        )
+        .unwrap_or(self.pane);
         match self.pane {
             UiPane::Diff => self.scroll_detail_page((delta * 3) as i16),
             _ => self.move_selection(delta),
