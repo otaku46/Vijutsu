@@ -156,7 +156,15 @@ impl TuiApp {
                     .exit_code
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "-".to_string());
-                format!("exit {exit} | {} | {}", entry.status, entry.command)
+                let mark = if entry.exit_code == Some(0) {
+                    '✓'
+                } else {
+                    '✗'
+                };
+                format!(
+                    "{mark} exit {exit:<4} {:<12} {}",
+                    entry.status, entry.command
+                )
             }));
         }
         self.show_overlay("Command Log", lines);

@@ -22,17 +22,35 @@ pub fn command_result_lines(result: &crate::cli::CommandResult) -> Vec<String> {
 }
 
 pub fn pane_mode_help() -> Vec<String> {
-    vec![
-        "Pane x Mode".to_string(),
-        String::new(),
-        "Pane        Inspect / Current                         Majutsu / Historical                  Shujutsu / Surgery".to_string(),
-        "Operation   h/l graph, Enter detail, S surgery         read-only detail, import via Files    a preview op abandon, Esc browse".to_string(),
-        "Change      e n d a s b Z, Space pin                   read-only; mutation blocked           no change mutation".to_string(),
-        "Files       Enter diff, O open, range select           I import historical file              no file mutation".to_string(),
-        "Diff        j/k scroll, Enter page, Shift+Enter up     same                                same".to_string(),
-        String::new(),
-        "Global      Tab/S-Tab pane, 1-4 focus, z maximize, L command log, ? help, q quit".to_string(),
+    [
+        "Operation pane",
+        "  j/k move    h/l graph parent/child",
+        "  Enter show operation detail",
+        "  S surgery mode (a preview abandon, Esc back)",
+        "  historical op: read-only, import via Files",
+        "",
+        "Change pane",
+        "  e edit    n new child    d describe",
+        "  a abandon    s squash    b rebase",
+        "  Z restore    Space pin/compare",
+        "  historical view: mutations blocked",
+        "",
+        "Files pane",
+        "  Enter diff    O open in editor",
+        "  Shift+Up/Down range    Cmd+click toggle",
+        "  I import historical file into @",
+        "",
+        "Diff pane",
+        "  j/k scroll    Enter page    Shift+Enter page up",
+        "",
+        "Global",
+        "  Tab / Shift+Tab switch pane    1-4 focus pane",
+        "  r refresh    R snapshot    z maximize",
+        "  L command log    ? this help    q quit",
     ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect()
 }
 
 pub fn non_empty_or(lines: Vec<String>, fallback: &str) -> Vec<String> {

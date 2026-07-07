@@ -11,7 +11,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
@@ -202,7 +202,7 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 areas[2],
             );
             if let Some((title, lines, scroll)) = app.modal_overlay() {
-                let area = centered_rect(40, 50, frame.size());
+                let area = centered_rect(60, 65, frame.size());
                 frame.render_widget(Clear, area);
                 frame.render_widget(
                     Paragraph::new(styled_lines(&lines))
@@ -540,32 +540,88 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
 }
 
 fn bottom_key_hint(app: &TuiApp) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("Keys ", Style::default().fg(Color::Green)),
-        Span::raw(context_key_hint(app)),
-    ])
+    let mut spans = vec![Span::styled("Keys ", Style::default().fg(Color::Green))];
+    for (index, (key, label)) in context_key_hint(app).iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(":{label}"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    Line::from(spans)
 }
 
-fn context_key_hint(app: &TuiApp) -> &'static str {
+fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
     if app.has_modal() {
-        return "Esc:close Enter/Shift+Enter:scroll ";
+        return &[("Esc", "close"), ("Enter/Shift+Enter", "scroll")];
     }
     match (app.mode, app.pane) {
-        (UiMode::Surgery, UiPane::Operation | UiPane::Repository) => {
-            "Tab:Pane j/k:Move h/l:Graph a:preview abandon Esc:Browse z:max ? "
-        }
-        (_, UiPane::Operation | UiPane::Repository) => {
-            "Tab:Pane j/k:Move h/l:Graph Enter:detail r:refresh R:snapshot S:Surgery z:max ? "
-        }
-        (_, UiPane::Change) => {
-            "Tab:Pane j/k:Move h/l:Graph Space:Pin r:refresh R:snapshot e:edit n:new d:describe a:abandon s:squash b:rebase Z:restore z:max ? "
-        }
-        (_, UiPane::Files) => {
-            "Tab:Pane j/k:Move Shift+↑↓:range Cmd+click:toggle Enter:diff O:open I:import r:refresh R:snapshot z:max ? "
-        }
-        (_, UiPane::Diff) => {
-            "Tab:Pane j/k:Scroll Enter:page Shift+Enter:page up r:refresh R:snapshot z:max L:log ? "
-        }
+        (UiMode::Surgery, UiPane::Operation | UiPane::Repository) => &[
+            ("Tab", "Pane"),
+            ("j/k", "Move"),
+            ("h/l", "Graph"),
+            ("a", "preview abandon"),
+            ("Esc", "Browse"),
+            ("z", "max"),
+            ("?", "help"),
+        ],
+        (_, UiPane::Operation | UiPane::Repository) => &[
+            ("Tab", "Pane"),
+            ("j/k", "Move"),
+            ("h/l", "Graph"),
+            ("Enter", "detail"),
+            ("r", "refresh"),
+            ("R", "snapshot"),
+            ("S", "Surgery"),
+            ("z", "max"),
+            ("?", "help"),
+        ],
+        (_, UiPane::Change) => &[
+            ("Tab", "Pane"),
+            ("j/k", "Move"),
+            ("h/l", "Graph"),
+            ("Space", "Pin"),
+            ("e", "edit"),
+            ("n", "new"),
+            ("d", "describe"),
+            ("a", "abandon"),
+            ("s", "squash"),
+            ("b", "rebase"),
+            ("Z", "restore"),
+            ("z", "max"),
+            ("?", "help"),
+        ],
+        (_, UiPane::Files) => &[
+            ("Tab", "Pane"),
+            ("j/k", "Move"),
+            ("Shift+↑↓", "range"),
+            ("Cmd+click", "toggle"),
+            ("Enter", "diff"),
+            ("O", "open"),
+            ("I", "import"),
+            ("r", "refresh"),
+            ("z", "max"),
+            ("?", "help"),
+        ],
+        (_, UiPane::Diff) => &[
+            ("Tab", "Pane"),
+            ("j/k", "Scroll"),
+            ("Enter", "page"),
+            ("Shift+Enter", "page up"),
+            ("r", "refresh"),
+            ("R", "snapshot"),
+            ("z", "max"),
+            ("L", "log"),
+            ("?", "help"),
+        ],
     }
 }
 

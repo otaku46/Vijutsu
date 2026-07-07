@@ -48,9 +48,9 @@ pub fn styled_lines(lines: &[String]) -> Vec<Line<'_>> {
     lines
         .iter()
         .map(|line| {
-            let color = if line.starts_with('+') {
+            let color = if line.starts_with('+') || line.starts_with('✓') {
                 Color::Green
-            } else if line.starts_with('-') {
+            } else if line.starts_with('-') || line.starts_with('✗') {
                 Color::Red
             } else if line.starts_with("@@") {
                 Color::Cyan
