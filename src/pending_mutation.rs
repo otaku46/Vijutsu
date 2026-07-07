@@ -395,6 +395,7 @@ impl MutationPreview {
             "Recoverability",
             &self.panel.recoverability_effect,
         );
+        lines.push(String::new());
         push_section(&mut lines, "Command", std::slice::from_ref(&self.command));
         lines.push(String::new());
         lines.push("Press y to execute, Esc or N to cancel.".to_string());
@@ -403,6 +404,12 @@ impl MutationPreview {
 }
 
 fn push_section(lines: &mut Vec<String>, title: &str, values: &[String]) {
+    if let [value] = values
+        && !value.is_empty()
+    {
+        lines.push(format!("{title}: {value}"));
+        return;
+    }
     lines.push(format!("{title}:"));
     for value in values {
         if value.is_empty() {
@@ -520,7 +527,7 @@ mod tests {
                 "Command:",
             ] {
                 assert!(
-                    lines.iter().any(|line| line == section),
+                    lines.iter().any(|line| line.starts_with(section)),
                     "{} preview missing {section}",
                     mutation.name()
                 );

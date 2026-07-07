@@ -220,6 +220,10 @@ impl TuiApp {
             .selected_operation_id()
             .map(|id| short(&id).to_string())
             .unwrap_or_else(|| "?".to_string());
+        vec![
+            format!("current op: {current}"),
+            format!("viewing op: {viewing} ({})", self.view_mode()),
+        ]
     }
 
     pub fn block_historical_mutation(&mut self, action: &str) -> bool {

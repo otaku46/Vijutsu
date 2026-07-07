@@ -19,10 +19,10 @@ use crate::editor::{ConfiguredLauncher, OpenRequest, TerminalLauncher, load_edit
 use crate::tui::{KeyAction, UiCommand, UiPane, handle_key_input};
 use crate::tui_app::{ActiveModal, TuiApp, UiMode};
 use crate::tui_runtime::{
-    diff_side_lines, focused_block, highlighted_diff_lines, selectable_list, styled_lines,
+    diff_side_lines, focused_block, highlighted_diff_lines, overlay_lines, selectable_list,
     visible_from,
 };
-use crate::tui_support::{centered_rect, is_command_modifier};
+use crate::tui_support::{centered_content_rect, is_command_modifier};
 
 pub fn run_tui_or_exit() {
     if let Err(error) = run_tui() {
@@ -202,10 +202,10 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 areas[2],
             );
             if let Some((title, lines, scroll)) = app.modal_overlay() {
-                let area = centered_rect(60, 65, frame.size());
+                let area = centered_content_rect(&title, &lines, frame.size());
                 frame.render_widget(Clear, area);
                 frame.render_widget(
-                    Paragraph::new(styled_lines(&lines))
+                    Paragraph::new(overlay_lines(&lines))
                         .block(focused_block(title.as_str(), true, Color::Yellow))
                         .scroll((scroll, 0))
                         .wrap(Wrap { trim: false }),
@@ -285,6 +285,12 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => app.execute_pending_mutation(),
                     KeyCode::Esc | KeyCode::Char('N') => app.cancel_pending_mutation(),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.scroll_overlay_page(3);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.scroll_overlay_page(-3);
+                    }
                     _ => {
                         app.status =
                             "pending mutation: press y to execute, Esc/N to cancel".to_string()
@@ -300,9 +306,11 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
                         app.refresh_diff();
                         app.status = "rebase selection cancelled".to_string();
                     }
+                    KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
+                    KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
                     _ => {
                         app.status =
-                            "rebase selection: choose destination, Enter confirm, Esc/N cancel"
+                            "rebase selection: j/k choose destination, Enter confirm, Esc/N cancel"
                                 .to_string()
                     }
                 }
@@ -311,17 +319,23 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result
             ActiveModal::Overlay(_) => {
                 match key.code {
                     KeyCode::Esc if app.mode == UiMode::Surgery => app.exit_surgery_mode(),
-                    KeyCode::Esc => {
-                        app.clear_overlay();
-                        app.set_browse_status("overlay closed");
-                    }
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         app.scroll_overlay_page(-12);
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Esc | KeyCode::Enter => {
+                        app.clear_overlay();
+                        app.set_browse_status("overlay closed");
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.scroll_overlay_page(3);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.scroll_overlay_page(-3);
+                    }
+                    KeyCode::Char(' ') => {
                         app.scroll_overlay_page(12);
                     }
-                    _ => app.status = "overlay open; Esc closes it".to_string(),
+                    _ => app.status = "overlay: Enter/Esc close, j/k scroll".to_string(),
                 }
                 continue;
             }
@@ -560,8 +574,30 @@ fn bottom_key_hint(app: &TuiApp) -> Line<'static> {
 }
 
 fn context_key_hint(app: &TuiApp) -> &'static [(&'static str, &'static str)] {
-    if app.has_modal() {
-        return &[("Esc", "close"), ("Enter/Shift+Enter", "scroll")];
+    match &app.modal {
+        ActiveModal::Overlay(_) => {
+            return &[("Enter/Esc", "close"), ("j/k", "scroll"), ("Space", "page")];
+        }
+        ActiveModal::Describe { .. }
+        | ActiveModal::Commit { .. }
+        | ActiveModal::Bookmark { .. } => {
+            return &[
+                ("Enter", "apply"),
+                ("Esc/N", "cancel"),
+                ("Backspace", "delete"),
+            ];
+        }
+        ActiveModal::PendingMutation { .. } => {
+            return &[("y", "execute"), ("Esc/N", "cancel"), ("j/k", "scroll")];
+        }
+        ActiveModal::Rebase { .. } => {
+            return &[
+                ("j/k", "choose destination"),
+                ("Enter", "confirm"),
+                ("Esc/N", "cancel"),
+            ];
+        }
+        ActiveModal::None => {}
     }
     match (app.mode, app.pane) {
         (UiMode::Surgery, UiPane::Operation | UiPane::Repository) => &[

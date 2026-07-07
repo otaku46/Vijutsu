@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use crossterm::event::KeyModifiers;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 
 use crate::tui::UiPane;
 
@@ -166,23 +166,22 @@ pub fn pane_at(
     }
 }
 
-pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
+pub fn centered_content_rect(title: &str, lines: &[String], area: Rect) -> Rect {
+    let content_width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count() + 2) as u16;
+    let content_height = lines.len() as u16;
+    let width = (content_width + 4).clamp(30, area.width.saturating_sub(4).max(30));
+    let height = (content_height + 2).clamp(5, area.height.saturating_sub(2).max(5));
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
 }
 
 pub fn is_root_commit(commit_id: &str) -> bool {
